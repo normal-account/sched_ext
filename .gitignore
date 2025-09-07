@@ -2,3 +2,8 @@
 *.txt
 *.o
 *.gz
+scx_flatcg
+*.mod.c
+bad*
+*.skel.h
+vmlinux.h

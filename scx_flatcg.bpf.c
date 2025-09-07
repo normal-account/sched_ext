@@ -43,9 +43,10 @@
 * within by using nested weighted vtime scheduling by default. The
 * cgroup-internal scheduling can be switched to FIFO with the -f option.
 */
+
+#include "vmlinux.h"
 #include <scx/common.bpf.h>
 #include "scx_flatcg.h"
-
 /*
 * Maximum amount of retries to find a valid cgroup.
 */
@@ -793,7 +794,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             //bpf_printk("\tfcg_enqueue: just added BK task (size %u)", cls_get_bk());
         }
 
-        fcg_log_enq_flags("fcg_enqueue", p, enq_flags);
+        //fcg_log_enq_flags("fcg_enqueue", p, enq_flags);
 
         if (cgc->rt_class) {
 
@@ -813,19 +814,22 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
                 }
 
 
-                bpf_printk("\tfcg_enqueue: RT enqueue task %d (cgroup %llu, q=%d) to cpu %d (rq=%d)", p->pid, cgrp->kn->id,
-                    scx_bpf_dsq_nr_queued(FALLBACK_DSQ), tgt, (SCX_DSQ_LOCAL_ON | tgt) );
+                s32 cpu = (s32)bpf_get_smp_processor_id();
 
 
-                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, SCX_SLICE_DFL, SCX_ENQ_HEAD | SCX_ENQ_PREEMPT );
+                u64 rq = (u64) SCX_DSQ_LOCAL_ON | (u64) tgt;
 
+                bpf_printk("\tfcg_enqueue: RT enqueue task %d (cgroup %llu, q=%d) to cpu %d)", p->pid, cgrp->kn->id,
+                    scx_bpf_dsq_nr_queued(FALLBACK_DSQ), tgt );
+
+                
+                scx_bpf_dsq_insert(p, rq, SCX_SLICE_DFL, SCX_ENQ_HEAD | SCX_ENQ_PREEMPT );
                 goto out_release;
             }
         }
 
-        //scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, SCX_SLICE_DFL, tvtime, enq_flags);
-
-        scx_bpf_dsq_insert(p, cgrp->kn->id, SCX_SLICE_DFL, enq_flags);
+        scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, SCX_SLICE_DFL, tvtime, enq_flags);
+        //scx_bpf_dsq_insert(p, cgrp->kn->id, SCX_SLICE_DFL, enq_flags);
 
         cgrp_enqueued(cgrp, cgc);
 
@@ -1233,10 +1237,10 @@ out_free:
 void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 {
     // TODO ADD BACK
-    if ( cpu == 0 || cpu == 1 )
-    {
-        bpf_printk("\tfcg_dispatch: called for cpu %d (tree sizes rt=%u bk=%u) (real num_rt=%u num_bk=%u)", cpu, cls_get_rt(), cls_get_bk(), tree_nodes_get_rt(), tree_nodes_get_bk());
-    }
+    //if ( cpu == 0 || cpu == 1 )
+    //{
+    //    bpf_printk("\tfcg_dispatch: called for cpu %d (tree sizes rt=%u bk=%u) (real num_rt=%u num_bk=%u)", cpu, cls_get_rt(), cls_get_bk(), tree_nodes_get_rt(), tree_nodes_get_bk());
+    //}
 
     struct fcg_cpu_ctx *cpuc;
     struct fcg_cgrp_ctx *cgc;
@@ -1535,5 +1539,5 @@ SCX_OPS_DEFINE(flatcg_ops,
         .cgroup_move		= (void *)fcg_cgroup_move,
         .init			= (void *)fcg_init,
         .exit			= (void *)fcg_exit,
-        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_ENQ_EXITING | SCX_OPS_ALLOW_QUEUED_WAKEUP | SCX_OPS_SWITCH_PARTIAL,
+        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_ENQ_EXITING | SCX_OPS_SWITCH_PARTIAL,
         .name			= "flatcg");
