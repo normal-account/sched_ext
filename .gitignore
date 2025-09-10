@@ -7,3 +7,4 @@ scx_flatcg
 bad*
 *.skel.h
 vmlinux.h
+linux-*

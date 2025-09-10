@@ -2,8 +2,17 @@
 LOADER_NAME := scx_flatcg
 SCHED_NAME := $(LOADER_NAME).bpf
 
+# Kernel version
+KVER=$(shell uname -r)
+
+# Strip distro-specific suffixes (e.g. -generic, -amd64) from kernel version
+BASVER=$(shell echo "$(KVER)" | sed -e 's/-.*//' -e 's/[[:space:]]//g')
+
+KERNEL_SRC_DIR := linux-$(BASVER)
+
 # --- loader config ---
 CC      ?= cc
+CFLAGS = -O2 -g -std=gnu11
 PKGCONF ?= pkg-config
 LIBBPF_CFLAGS := $(shell $(PKGCONF) --cflags libbpf)
 LIBBPF_LIBS   := $(shell $(PKGCONF) --libs   libbpf)
@@ -13,10 +22,10 @@ LIBBPF_LIBS   := $(shell $(PKGCONF) --libs   libbpf)
 all: build stop loader start_loader
 
 build:
-	clang -O2 -g -target bpf \
+	clang $(CFLAGS) -target bpf \
 	  -I . \
-	  -I /usr/src/linux-source-6.16.10/tools/sched_ext/include \
-	  -c $(SCHED_NAME).c -o $(SCHED_NAME).bpf.o
+	  -I $(KERNEL_SRC_DIR)/tools/sched_ext/include \
+	  -c $(SCHED_NAME).c -o $(SCHED_NAME).o
 	bpftool gen skeleton $(SCHED_NAME).o > $(SCHED_NAME).skel.h
 
 vmlinux:
@@ -44,9 +53,9 @@ state:
 loader: $(LOADER_NAME)
 
 $(LOADER_NAME): $(LOADER_NAME) $(SCHED_NAME).skel.h
-	$(CC) -O2 -g $(LIBBPF_CFLAGS) \
+	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) \
 	  -I . \
-	  -I /usr/src/linux-source-6.16.10/tools/sched_ext/include \
+	  -I $(KERNEL_SRC_DIR)/tools/sched_ext/include \
 	  $(LOADER_NAME).c -o $(LOADER_NAME) $(LIBBPF_LIBS)
 
 # Start your scheduler via the loader (keeps the process alive)
