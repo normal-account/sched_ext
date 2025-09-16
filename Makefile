@@ -21,7 +21,7 @@ LIBBPF_LIBS   := $(shell $(PKGCONF) --libs   libbpf)
 
 all: build stop loader start_loader
 
-build:
+build: $(SCHED_NAME).c
 	clang $(CFLAGS) -target bpf \
 	  -I . \
 	  -I $(KERNEL_SRC_DIR)/tools/sched_ext/include \
@@ -55,6 +55,7 @@ loader: $(LOADER_NAME)
 $(LOADER_NAME): $(LOADER_NAME) $(SCHED_NAME).skel.h
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) \
 	  -I . \
+	  -I /usr/include/bpf \
 	  -I $(KERNEL_SRC_DIR)/tools/sched_ext/include \
 	  $(LOADER_NAME).c -o $(LOADER_NAME) $(LIBBPF_LIBS)
 

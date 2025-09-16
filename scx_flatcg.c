@@ -17,6 +17,8 @@
 #include <scx/common.h>
 #include "scx_flatcg.h"
 #include "scx_flatcg.bpf.skel.h"
+#include <stddef.h>
+#include <stdlib.h>
 
 #ifndef FILEID_KERNFS
 #define FILEID_KERNFS		0xfe
@@ -141,36 +143,7 @@ restart:
 
 	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
 	assert(skel->rodata->nr_cpus > 0);
-	skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
-
-	while ((opt = getopt(argc, argv, "s:i:dfvh")) != -1) {
-		double v;
-
-		switch (opt) {
-		case 's':
-			v = strtod(optarg, NULL);
-			skel->rodata->cgrp_slice_ns = v * 1000;
-			break;
-		case 'i':
-			v = strtod(optarg, NULL);
-			intv_ts.tv_sec = v;
-			intv_ts.tv_nsec = (v - (float)intv_ts.tv_sec) * 1000000000;
-			break;
-		case 'd':
-			dump_cgrps = true;
-			break;
-		case 'f':
-			skel->rodata->fifo_sched = true;
-			break;
-		case 'v':
-			verbose = true;
-			break;
-		case 'h':
-		default:
-			fprintf(stderr, help_fmt, basename(argv[0]));
-			return opt != 'h';
-		}
-	}
+	//skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
 
 	printf("slice=%.1lfms intv=%.1lfs dump_cgrps=%d",
 	       (double)skel->rodata->cgrp_slice_ns / 1000000.0,
