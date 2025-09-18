@@ -52,7 +52,7 @@ state:
 # Build the userspace loader; depends on the generated skeleton header
 loader: $(LOADER_NAME)
 
-$(LOADER_NAME): $(LOADER_NAME) $(SCHED_NAME).skel.h
+$(LOADER_NAME): $(SCHED_NAME).skel.h
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) \
 	  -I . \
 	  -I /usr/include/bpf \
