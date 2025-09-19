@@ -2,7 +2,7 @@
 *.txt
 *.o
 *.gz
-scx_flatcg
+scx_weightedcg
 *.mod.c
 bad*
 *.skel.h

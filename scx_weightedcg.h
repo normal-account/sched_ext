@@ -1,5 +1,5 @@
-#ifndef __SCX_EXAMPLE_FLATCG_H
-#define __SCX_EXAMPLE_FLATCG_H
+#ifndef __SCX_WEIGHTEDCG_H
+#define __SCX_WEIGHTEDCG_H
 
 enum {
 	FCG_HWEIGHT_ONE		= 1LLU << 16,
@@ -48,8 +48,19 @@ struct fcg_cgrp_ctx {
 	s64			cvtime_delta;
 	u64			tvtime_now;
 
-	u32  has_tasks;   // 0/1: this cgroup DSQ currently non-empty
-	u8  rt_class;    // 1=RT, 0=BK
+	u32  has_tasks;   	// 0/1: this cgroup DSQ currently non-empty
+	u8  rt_class;    	// 1=RT, 0=BK
+	u64 enq_count;        // monotonic, bumps on every enqueue intent
 };
 
-#endif /* __SCX_EXAMPLE_FLATCG_H */
+#ifndef FCG_DEBUG
+#define FCG_DEBUG 0
+#endif
+
+#if FCG_DEBUG
+#define log(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
+#else
+#define log(fmt, ...)
+#endif
+
+#endif

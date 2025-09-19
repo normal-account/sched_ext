@@ -1,9 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Copyright (c) 2023 Meta Platforms, Inc. and affiliates.
- * Copyright (c) 2023 Tejun Heo <tj@kernel.org>
- * Copyright (c) 2023 David Vernet <dvernet@meta.com>
- */
 #include <stdio.h>
 #include <signal.h>
 #include <assert.h>
@@ -15,8 +9,8 @@
 #include <time.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
-#include "scx_flatcg.h"
-#include "scx_flatcg.bpf.skel.h"
+#include "scx_weightedcg.h"
+#include "scx_weightedcg.bpf.skel.h"
 #include <stddef.h>
 #include <stdlib.h>
 
@@ -102,7 +96,7 @@ static float read_cpu_util(__u64 *last_sum, __u64 *last_idle)
 	return delta_sum ? (float)(delta_sum - delta_idle) / delta_sum : 0.0;
 }
 
-static void fcg_read_stats(struct scx_flatcg_bpf *skel, __u64 *stats)
+static void fcg_read_stats(struct scx_weightedcg_bpf *skel, __u64 *stats)
 {
 	__u64 cnts[FCG_NR_STATS][skel->rodata->nr_cpus];
 	__u32 idx;
@@ -123,7 +117,7 @@ static void fcg_read_stats(struct scx_flatcg_bpf *skel, __u64 *stats)
 
 int main(int argc, char **argv)
 {
-	struct scx_flatcg_bpf *skel;
+	struct scx_weightedcg_bpf *skel;
 	struct bpf_link *link;
 	struct timespec intv_ts = { .tv_sec = 2, .tv_nsec = 0 };
 	bool dump_cgrps = false;
@@ -139,9 +133,9 @@ int main(int argc, char **argv)
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 restart:
-	skel = SCX_OPS_OPEN(flatcg_ops, scx_flatcg_bpf);
+	skel = SCX_OPS_OPEN(weightedcg_ops, scx_weightedcg_bpf);
 
-	skel->rodata->nr_cpus = 16;//libbpf_num_possible_cpus();
+	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
 	assert(skel->rodata->nr_cpus > 0);
 	//skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
 
@@ -150,8 +144,8 @@ restart:
 	       (double)intv_ts.tv_sec + (double)intv_ts.tv_nsec / 1000000000.0,
 	       dump_cgrps);
 
-	SCX_OPS_LOAD(skel, flatcg_ops, scx_flatcg_bpf, uei);
-	link = SCX_OPS_ATTACH(skel, flatcg_ops, scx_flatcg_bpf);
+	SCX_OPS_LOAD(skel, weightedcg_ops, scx_weightedcg_bpf, uei);
+	link = SCX_OPS_ATTACH(skel, weightedcg_ops, scx_weightedcg_bpf);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		__u64 acc_stats[FCG_NR_STATS];
@@ -204,7 +198,7 @@ restart:
 
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
-	scx_flatcg_bpf__destroy(skel);
+	scx_weightedcg_bpf__destroy(skel);
 
 	if (UEI_ECODE_RESTART(ecode))
 		goto restart;

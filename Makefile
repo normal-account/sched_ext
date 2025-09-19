@@ -1,5 +1,5 @@
 # See https://github.com/sched-ext/scx/wiki
-LOADER_NAME := scx_flatcg
+LOADER_NAME := scx_weightedcg
 SCHED_NAME := $(LOADER_NAME).bpf
 
 # Kernel version
