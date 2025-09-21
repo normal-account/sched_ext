@@ -39,6 +39,11 @@ static void stat_inc(enum fcg_stat_idx idx)
 struct fcg_cpu_ctx {
     u64			cur_cgid;
     u64			cur_at;
+
+#ifdef FCG_DEBUG
+    u64  first_move_ts;     // when we successfully moved that DSQ to local
+    u32  move_seq;    // bumps on each arm to avoid stale races (optional)
+#endif
 };
 
 struct {
@@ -225,6 +230,106 @@ bool is_cgroup_hw(struct cgroup *cgrp)
     bpf_probe_read_kernel(&name, sizeof(name), cgrp->kn->name);
     return (name[0]=='h' && name[1]=='w' && name[2]=='\0');
 }
+
+/* CGROUP STAT UTILS START */
+
+// Hash keyed by your DSQ id / cgid (cgrp->kn->id), easy to query
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u64);             // cgid (cgrp->kn->id)
+    __type(value, struct fcg_cgrp_stats);
+} cgrp_stats SEC(".maps");
+
+static void cgrp_enqueue_stat( struct cgroup *cgrp, struct fcg_cgrp_ctx* cgc )
+{
+#if FCG_DEBUG
+    if ( !cgrp || !cgc ) return;
+
+    u64 cgid = cgrp->kn->id;
+
+    if ( cgid <= 1 ) return; // Ignore default cgroup
+
+    struct fcg_cgrp_stats *cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid );
+    if (!cg_stat) {
+        struct fcg_cgrp_stats zero = {};
+        if (bpf_map_update_elem(&cgrp_stats, &cgid, &zero, BPF_NOEXIST))
+            return;
+            cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid);
+    
+        if (!cg_stat) return;
+
+        bpf_probe_read_kernel_str(cg_stat->name, sizeof(cg_stat->name), cgrp->kn->name);
+        cg_stat->weight = cgc->weight;
+        cg_stat->rt_class = is_cgroup_hw( cgrp );
+    }
+
+    // Read atomically
+    if ( 0 == __sync_fetch_and_add( &cg_stat->first_enq_ts, 0) )
+    {
+        __sync_val_compare_and_swap( &cg_stat->first_enq_ts, 0, scx_bpf_now() );
+    }
+#endif
+}
+
+static void cgrp_dispatch_stat( __u64 cgid, struct fcg_cgrp_ctx* cgc, struct fcg_cpu_ctx *cpuc )
+{
+#if FCG_DEBUG
+    if ( !cgc || !cpuc ) return;
+
+    // 1. Store enqueue-dispatch stats
+    struct fcg_cgrp_stats *cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid );
+    if (!cg_stat) return;
+
+    // Read atomically
+    __u64 ts = __sync_fetch_and_add( &cg_stat->first_enq_ts, 0 );
+    if ( ts == 0 ) return; // Not armed
+
+    // Win the race to clear to 0
+    if (__sync_val_compare_and_swap( &cg_stat->first_enq_ts, ts, 0 ) != ts )
+        return; // Someone else recorded
+
+    __u64 lat = scx_bpf_now() - ts;
+
+    __sync_fetch_and_add( &cg_stat->lat_sum_ns, lat );
+    __sync_fetch_and_add( &cg_stat->lat_cnt, 1 );
+
+
+    // 2. Prep dispatch-running stats
+    if ( cpuc->first_move_ts == 0 )
+    {
+        __sync_fetch_and_add( &cpuc->first_move_ts, scx_bpf_now() );
+    }
+
+#endif
+}
+
+static void cgrp_running_stat( __u64 cgid, struct fcg_cgrp_ctx* cgc, struct fcg_cpu_ctx *cpuc )
+{
+#if FCG_DEBUG
+    if ( !cgc || !cpuc ) return;
+
+    struct fcg_cgrp_stats *cg_stat = bpf_map_lookup_elem( &cgrp_stats, &cgid );
+    if (!cg_stat) return;
+
+    // Read atomically
+    __u64 ts = __sync_fetch_and_add( &cpuc->first_move_ts, 0 );
+    if ( ts == 0 ) return; // Not armed
+
+    // Win the race to clear to 0
+    if (__sync_val_compare_and_swap( &cpuc->first_move_ts, ts, 0 ) != ts )
+        return; // Someone else recorded
+
+    __u64 lat = scx_bpf_now() - ts;
+
+    // Increment the CGRP stats with the CPU stats
+    __sync_fetch_and_add( &cg_stat->move_lat_sum_ns, lat );
+    __sync_fetch_and_add( &cg_stat->move_lat_cnt, 1 );
+
+#endif
+}
+
+/* CGROUP STAT UTILS END */
 
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
@@ -729,6 +834,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         if (__sync_val_compare_and_swap(&cgc->has_tasks, 0, 1) == 0)
         {
+            cgrp_enqueue_stat( cgrp, cgc );
             cls_inc(cgc->rt_class);
             log("\t\tfcg_enqueue: inc tree RT=%d for task %d (tree sizes rt=%u bk=%u) (real num_rt=%u num_bk=%d)", cgc->rt_class, p->pid, cls_get_rt(), cls_get_bk(), tree_nodes_get_rt(), tree_nodes_get_bk());
         }
@@ -867,19 +973,23 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
 
     /* Update per-CPU current cgid immediately for selected CPU */
+
+    s32 cpu = (s32)bpf_get_smp_processor_id();
+    u64 sel_id = cgrp->kn->id;
+    bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
+    if (should_log(p->comm, 0))
     {
-        s32 cpu = (s32)bpf_get_smp_processor_id();
-        u64 sel_id = cgrp->kn->id;
-        bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
-        if (should_log(p->comm, 0))
-        {
-            log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
-            dump_cur_cgid(1);
-        }
+        log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
+        dump_cur_cgid(1);
     }
 
     cgc = find_cgrp_ctx(cgrp);
-    if (cgc) {
+    if (cgc) 
+    {
+        struct fcg_cpu_ctx *cpuc = find_cpu_ctx();
+
+        cgrp_running_stat( sel_id, cgc, cpuc );
+
         /*
         * @cgc->tvtime_now always progresses forward as tasks start
         * executing. The test and update can be performed concurrently
@@ -984,7 +1094,7 @@ void BPF_STRUCT_OPS(fcg_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
     bpf_spin_unlock(&cgv_tree_lock);
 }
 
-static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 cpu)
+static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 cpu, struct fcg_cpu_ctx *cpuc)
 {
     struct bpf_rb_node *rb_node;
     struct cgv_node_stash *stash;
@@ -1050,10 +1160,18 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     bool logAffinityFail = false;
     bool logTreeDec = false;
 
+
+    if ( scx_bpf_dsq_nr_queued(cgid) > 1 )
+    {
+        log("\tfcg_dispatch: WARNING nr queued > 1 for cgroup %llu (nr q = %llu)", cgid, scx_bpf_dsq_nr_queued(cgid) );
+    }
+
     u64 enq_count =__sync_fetch_and_add(&cgc->enq_count, 0);
 
     if (scx_bpf_dsq_move_to_local(cgid)) 
     {
+        cgrp_dispatch_stat( cgid, cgc, cpuc );
+
         if ( enq_count > 0 ) __sync_sub_and_fetch(&cgc->enq_count, 1);   
 
         if ( 0 == scx_bpf_dsq_nr_queued(cgid) && __sync_val_compare_and_swap(&cgc->has_tasks, 1, 0) == 1 ) 
@@ -1214,6 +1332,8 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 
             if ( cgrp )
             {
+                cgrp_dispatch_stat( cpuc->cur_cgid, cgc, cpuc );
+
                 if ( cgc && cgc->rt_class)
                 {
                     log("\tfcg_dispatch: staying on same CPU %d for cgroup %llu", cpu, cpuc->cur_cgid);
@@ -1299,7 +1419,7 @@ pick_next_cgroup:
     if ( cpu < NR_CPUS_LOG ) log("\tfcg_dispatch: pick_next_cgroup trying to move RT to local (size %u) on cpu %d", cls_get_rt(), cpu);
 
     //bpf_repeat(CGROUP_MAX_RETRIES) {
-        if (try_pick_next_cgroup(&cpuc->cur_cgid, &cgv_tree_rt, cpu)) {
+        if (try_pick_next_cgroup( &cpuc->cur_cgid, &cgv_tree_rt, cpu, cpuc )) {
             if (cpuc->cur_cgid)   // non-zero only when we actually moved a DSQ
             {
                 return;
@@ -1317,7 +1437,7 @@ pick_from_BG:
             log("\tfcg_dispatch: pick_next_cgroup trying to move BK to local (size %u) on cpu %d", cls_get_bk(), cpu);
 
         //bpf_repeat(CGROUP_MAX_RETRIES) {
-            if (try_pick_next_cgroup(&cpuc->cur_cgid, &cgv_tree_bk, cpu)) {
+            if (try_pick_next_cgroup( &cpuc->cur_cgid, &cgv_tree_bk, cpu, cpuc )) {
                 if (cpuc->cur_cgid)   // non-zero only when we actually moved a DSQ
                 {
                     return;

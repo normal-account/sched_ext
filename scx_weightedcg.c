@@ -13,6 +13,8 @@
 #include "scx_weightedcg.bpf.skel.h"
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
+
 
 #ifndef FILEID_KERNFS
 #define FILEID_KERNFS		0xfe
@@ -45,6 +47,36 @@ static void sigint_handler(int dummy)
 {
 	exit_req = 1;
 }
+
+static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel) 
+{
+	int fd = bpf_map__fd(skel->maps.cgrp_stats);
+	struct fcg_cgrp_stats val;
+	__u64 key = 0, next;
+
+	for (;;) {
+		if (bpf_map_get_next_key(fd, &key, &next) != 0) break;
+		if (bpf_map_lookup_elem(fd, &next, &val) == 0) 
+		{
+			if ( strcmp(val.name, "session") != 0 )
+			{
+			double avg_ms = (val.lat_cnt ? (double)val.lat_sum_ns / val.lat_cnt / 1e6 : 0.0);
+			double move_avg_ms = (val.move_lat_cnt ? (double)val.move_lat_sum_ns / val.move_lat_cnt : 0.0);
+
+			printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu   cnt:%6llu  dp avg:%6.2f  move cnt:%6llu move(ns) avg:%6.0f\n",
+				val.name,
+				val.rt_class,
+				val.weight,
+				(unsigned long long)val.lat_cnt,
+				avg_ms,
+				val.move_lat_cnt,
+				move_avg_ms);
+			}
+		}
+		key = next;
+	}
+}
+
 
 static float read_cpu_util(__u64 *last_sum, __u64 *last_idle)
 {
@@ -191,6 +223,9 @@ restart:
 			   stats[FCG_STAT_PNC_AFFINITY]);
 		printf("BAD      remove:%6llu\n",
 		       acc_stats[FCG_STAT_BAD_REMOVAL]);
+
+		fcg_read_cgrp_stats( skel );
+		
 		fflush(stdout);
 
 		nanosleep(&intv_ts, NULL);
