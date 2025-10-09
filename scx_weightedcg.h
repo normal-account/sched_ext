@@ -57,8 +57,12 @@ struct fcg_cgrp_stats {
 	char  name[8];
 
 	__u64 first_enq_ts;   	// 0 ==> not armed
+
 	__u64 lat_sum_ns;     	// accumulated activation latency
-    __u64 lat_cnt;        	// number of samples
+    __u64 lat_cnt;        	// number of 
+	__u64 lat_max;
+
+	__u64 dir_enq_cnt;
 
 	__u64 move_lat_sum_ns;
 	__u64 move_lat_cnt;

@@ -211,9 +211,7 @@ static void dump_cur_cgid(int start)
                 } else {
                     log("\t\t\tcur_cgid[%u] = %llu (lookup failed)", i, *val);
                 }
-            } /*else {
-                log("\t\t\tcur_cgid[%u] = 0", i);
-            }*/
+            }
         }
     }
 
@@ -223,12 +221,42 @@ static void dump_cur_cgid(int start)
         log("\t\tcur_cgid: STOPPED dump end");
 }
 
-// Temporary function to determine whether a cgroup is real-time or background. To revisit.
-bool is_cgroup_hw(struct cgroup *cgrp)
+static __always_inline bool str_is_hw(const char *s)
 {
-    char name[32];
-    bpf_probe_read_kernel(&name, sizeof(name), cgrp->kn->name);
-    return (name[0]=='h' && name[1]=='w' && name[2]=='\0');
+    /* exact "hw" */
+    return s[0] == 'h' && s[1] == 'w' && s[2] == '\0';
+}
+
+// Check if cgroup is "hw" OR its parent cgroup is "hw"
+static __always_inline bool is_cgroup_hw(struct cgroup *cgrp)
+{
+    struct kernfs_node *kn  = NULL;
+    struct kernfs_node *pkn = NULL;
+    const char *nptr = NULL, *pptr = NULL;
+    char leaf[3+1] = {}, par[3+1] = {};
+
+    if (!cgrp)
+        return false;
+
+    /* leaf name */
+    bpf_probe_read_kernel(&kn, sizeof(kn), &cgrp->kn);
+    if (!kn)
+        return false;
+
+    bpf_probe_read_kernel(&nptr, sizeof(nptr), &kn->name);
+    bpf_probe_read_kernel_str(leaf, sizeof(leaf), nptr);
+    if (str_is_hw(leaf))
+        return true;
+
+    /* parent name (root has no parent) */
+    bpf_probe_read_kernel(&pkn, sizeof(pkn), &kn->__parent);
+    if (!pkn)
+        return false;
+
+    bpf_probe_read_kernel(&pptr, sizeof(pptr), &pkn->name);
+    bpf_probe_read_kernel_str(par, sizeof(par), pptr);
+
+    return str_is_hw(par);
 }
 
 /* CGROUP STAT UTILS START */
@@ -241,7 +269,7 @@ struct {
     __type(value, struct fcg_cgrp_stats);
 } cgrp_stats SEC(".maps");
 
-static void cgrp_enqueue_stat( struct cgroup *cgrp, struct fcg_cgrp_ctx* cgc )
+static void cgrp_enqueue_stat( struct cgroup *cgrp, struct fcg_cgrp_ctx* cgc, bool direct_enqueue )
 {
 #if FCG_DEBUG
     if ( !cgrp || !cgc ) return;
@@ -264,10 +292,17 @@ static void cgrp_enqueue_stat( struct cgroup *cgrp, struct fcg_cgrp_ctx* cgc )
         cg_stat->rt_class = is_cgroup_hw( cgrp );
     }
 
-    // Read atomically
-    if ( 0 == __sync_fetch_and_add( &cg_stat->first_enq_ts, 0) )
+    if ( direct_enqueue )
     {
-        __sync_val_compare_and_swap( &cg_stat->first_enq_ts, 0, scx_bpf_now() );
+        __sync_fetch_and_add( &cg_stat->dir_enq_cnt, 1 );
+    }
+    else
+    {
+        // Read atomically
+        if ( 0 == __sync_fetch_and_add( &cg_stat->first_enq_ts, 0) )
+        {
+            __sync_val_compare_and_swap( &cg_stat->first_enq_ts, 0, scx_bpf_now() );
+        }
     }
 #endif
 }
@@ -291,9 +326,22 @@ static void cgrp_dispatch_stat( __u64 cgid, struct fcg_cgrp_ctx* cgc, struct fcg
 
     __u64 lat = scx_bpf_now() - ts;
 
-    __sync_fetch_and_add( &cg_stat->lat_sum_ns, lat );
-    __sync_fetch_and_add( &cg_stat->lat_cnt, 1 );
+    if ( cgc->rt_class)
+    {
+        log("\tcgrp_dispatch_stat: ts = %llu, bumping count", ts);
+    }
 
+    //if ( lat < 50 ) // Ignore extreme values
+    {
+        __sync_fetch_and_add( &cg_stat->lat_sum_ns, lat );
+        __sync_fetch_and_add( &cg_stat->lat_cnt, 1 );
+
+        __u64 lat_max = __sync_fetch_and_add( &cg_stat->lat_max, 0 );
+        if ( lat > lat_max )
+        {
+            __sync_val_compare_and_swap( &cg_stat->lat_max, lat_max, lat );
+        }
+    }
 
     // 2. Prep dispatch-running stats
     if ( cpuc->first_move_ts == 0 )
@@ -573,6 +621,27 @@ static void set_bypassed_at(struct task_struct *p, struct fcg_task_ctx *taskc)
     taskc->bypassed_at = p->se.sum_exec_runtime ?: (u64)-1;
 }
 
+// helper: is the CPU currently running a RT  cgroup?
+static __always_inline u64 cpu_running_rt(s32 cpu)
+{
+    u32 k = (u32)cpu;
+    u64 *cgidp = bpf_map_lookup_elem(&cur_cgid, &k);
+    if (!cgidp || !*cgidp)         // 0 => idle/fallback/unknown: treat as BK
+    {
+        return 0;
+    }
+
+    struct cgroup *cg = bpf_cgroup_from_id(*cgidp);
+    if (!cg)
+    {
+        return 0;          // cgroup raced away, don’t block the kick
+    }
+    struct fcg_cgrp_ctx *cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
+    u32 is_rt = (!cgc || cgc->rt_class == 1);
+    bpf_cgroup_release(cg);
+    return is_rt ? *cgidp : 0;
+}
+
 // helper: is the CPU currently running a BK (non-RT) cgroup?
 static __always_inline bool cpu_running_bk(s32 cpu)
 {
@@ -638,8 +707,18 @@ static __always_inline s32 pick_cpu_to_kick_for_rt(struct task_struct *p, bool *
         if (off >= nr_cpus) break;
         cpu = (start + off) % nr_cpus;
 
-        if (bpf_cpumask_test_cpu(cpu, allowed) && cpu_running_bk(cpu))
-            return cpu;
+        if (bpf_cpumask_test_cpu(cpu, allowed))
+        {
+            u64 cgid = cpu_running_rt(cpu);
+            if ( !cgid )
+            {
+                return cpu;
+            }
+            else 
+            {
+                log("\tpick_cpu_to_kick_for_rt: CPU %d already running RT %llu for pid %d, cannot kick", cpu, cgid, p->pid);
+            }
+        }
     }
 
 any:
@@ -810,7 +889,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         if ( cgc->rt_class ) 
         {
-            bool is_idle = false;
+            bool is_idle = !cgc->rt_class;
             s32 tgt = pick_cpu_to_kick_for_rt(p, &is_idle);
 
             if (tgt >= 0 && tgt < nr_cpus)
@@ -827,6 +906,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
                 }
 
 
+                cgrp_enqueue_stat( cgrp, cgc, true );
+
                 scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, SCX_SLICE_DFL, enq_flags);
                 goto out_release;
             }
@@ -834,7 +915,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         if (__sync_val_compare_and_swap(&cgc->has_tasks, 0, 1) == 0)
         {
-            cgrp_enqueue_stat( cgrp, cgc );
+            cgrp_enqueue_stat( cgrp, cgc, false );
             cls_inc(cgc->rt_class);
             log("\t\tfcg_enqueue: inc tree RT=%d for task %d (tree sizes rt=%u bk=%u) (real num_rt=%u num_bk=%d)", cgc->rt_class, p->pid, cls_get_rt(), cls_get_bk(), tree_nodes_get_rt(), tree_nodes_get_bk());
         }
@@ -1045,7 +1126,7 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
 log_and_out:
 /* Clear per-CPU current cgid only on sleep so select_cpu can consider this CPU again */
 
-    if ( !runnable )
+    //if ( !runnable )
     {
         u64 zero = 0;
         bpf_map_update_elem(&cur_cgid, &cpu, &zero, BPF_ANY);
@@ -1058,7 +1139,7 @@ log_and_out:
             dump_cur_cgid(0);
         }
         else if (p->scx.slice > 0)
-            log("\tstopping: preempt pid %d comm %s on cpu %d (slice_left=%u, q=%d)", p->pid, p->comm, cpu, p->scx.slice, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
+            log("\tstopping: preempt pid %d comm %s on cpu %d (slice_left=%u)", p->pid, p->comm, cpu, p->scx.slice);
         else
             log("\tstopping: timeslice/yield pid %d comm %s on cpu %d", p->pid, p->comm, cpu);
     }
@@ -1092,6 +1173,13 @@ void BPF_STRUCT_OPS(fcg_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
         pcgc->child_weight_sum += (s64)weight - cgc->weight;
     cgc->weight = weight;
     bpf_spin_unlock(&cgv_tree_lock);
+
+        /* *** invalidate cached hweights so refresh actually runs *** */
+    __sync_fetch_and_add(&hweight_gen, 1);
+
+    /* Optional: refresh now if active so next dispatch uses new hweight */
+    if (cgc->nr_active)
+        cgrp_refresh_hweight(cgrp, cgc);
 }
 
 static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 cpu, struct fcg_cpu_ctx *cpuc)
@@ -1161,7 +1249,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     bool logTreeDec = false;
 
 
-    if ( scx_bpf_dsq_nr_queued(cgid) > 1 )
+    if ( cgc->rt_class && scx_bpf_dsq_nr_queued(cgid) > 1 )
     {
         log("\tfcg_dispatch: WARNING nr queued > 1 for cgroup %llu (nr q = %llu)", cgid, scx_bpf_dsq_nr_queued(cgid) );
     }
@@ -1189,9 +1277,9 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
         if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed (is RT tree %d) (enq_count=%llu)", cgid, &cgv_tree_rt == cgv_tree, enq_count);
 
-        if ( false && qsz == 0 && enq_count == 0 )
+        if ( qsz == 0 && enq_count == 0 )
         {
-            log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed: EMPTY branch (enq_count=%llu)", cgid, enq_count );
+            ///log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed: EMPTY branch (enq_count=%llu)", cgid, enq_count );
             bpf_cgroup_release(cgrp);
             stat_inc(FCG_STAT_PNC_EMPTY);
 
@@ -1199,7 +1287,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         }
         else
         {
-            log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed: AFF FAIL branch (enq_count=%llu)", cgid, enq_count );
+            //log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed: AFF FAIL branch (enq_count=%llu)", cgid, enq_count );
 
             logAffinityFail = true;
             stat_inc(FCG_STAT_PNC_AFFINITY);
@@ -1622,6 +1710,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)fcg_cgroup_move,
         .init			= (void *)fcg_init,
         .exit			= (void *)fcg_exit,
-        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_SWITCH_PARTIAL,
+        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT,// | SCX_OPS_SWITCH_PARTIAL,
         .timeout_ms		= 5000U,
         .name			= "weightedcg");

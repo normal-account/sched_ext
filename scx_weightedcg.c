@@ -61,14 +61,17 @@ static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel)
 			if ( strcmp(val.name, "session") != 0 )
 			{
 			double avg_ms = (val.lat_cnt ? (double)val.lat_sum_ns / val.lat_cnt / 1e6 : 0.0);
+			double max_ms = (val.lat_max ? (double)val.lat_max / 1e6 : 0.0);
 			double move_avg_ms = (val.move_lat_cnt ? (double)val.move_lat_sum_ns / val.move_lat_cnt : 0.0);
 
-			printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu   cnt:%6llu  dp avg:%6.2f  move cnt:%6llu move(ns) avg:%6.0f\n",
+			printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu  dir enq: %6llu  cnt:%6llu dp avg:%6.2f  dp max:%6.2f move cnt:%6llu move(ns) avg:%6.0f\n",
 				val.name,
 				val.rt_class,
 				val.weight,
+				(unsigned long long)val.dir_enq_cnt,
 				(unsigned long long)val.lat_cnt,
 				avg_ms,
+				max_ms,
 				val.move_lat_cnt,
 				move_avg_ms);
 			}
@@ -169,7 +172,7 @@ restart:
 
 	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
 	assert(skel->rodata->nr_cpus > 0);
-	//skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
+	skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
 
 	printf("slice=%.1lfms intv=%.1lfs dump_cgrps=%d",
 	       (double)skel->rodata->cgrp_slice_ns / 1000000.0,
