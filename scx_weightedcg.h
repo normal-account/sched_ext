@@ -37,6 +37,9 @@ enum fcg_stat_idx {
 	FCG_NR_STATS,
 };
 
+#define FCG_CPU_MASK_BITS 256
+#define FCG_MASK_WORDS    (FCG_CPU_MASK_BITS / 64)
+
 struct fcg_cgrp_ctx {
 	u32			nr_active;
 	u32			nr_runnable;
@@ -51,6 +54,10 @@ struct fcg_cgrp_ctx {
 	u32  has_tasks;   		// 0/1: this cgroup DSQ currently non-empty
 	u8  rt_class;    		// 1=RT, 0=BK
 	u64 enq_count;        	// monotonic, bumps on every enqueue intent
+
+	struct bpf_spin_lock cpuset_lock;
+    __u64 cpuset_mask[FCG_MASK_WORDS];
+    __u32 cpuset_init;
 };
 
 struct fcg_cgrp_stats {
@@ -76,9 +83,9 @@ struct fcg_cgrp_stats {
 #endif
 
 #if FCG_DEBUG
-#define log(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( true || rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
-#define log(fmt, ...)
+#define log(fmt, rt_class, ...)
 #endif
 
 #endif

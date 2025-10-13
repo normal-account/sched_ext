@@ -8,3 +8,4 @@ bad*
 *.skel.h
 vmlinux.h
 linux-*
+bench.md
