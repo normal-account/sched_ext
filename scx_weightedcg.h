@@ -51,7 +51,6 @@ struct fcg_cgrp_ctx {
 	s64			cvtime_delta;
 	u64			tvtime_now;
 
-	u32  has_tasks;   		// 0/1: this cgroup DSQ currently non-empty
 	u8  rt_class;    		// 1=RT, 0=BK
 	u64 enq_count;        	// monotonic, bumps on every enqueue intent
 
@@ -78,8 +77,12 @@ struct fcg_cgrp_stats {
 	u32			weight;
 };
 
+#ifndef DIR_ENQ
+#define DIR_ENQ 1
+#endif
+
 #ifndef FCG_DEBUG
-#define FCG_DEBUG 1
+//#define FCG_DEBUG 1
 #endif
 
 #if FCG_DEBUG
