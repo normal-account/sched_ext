@@ -16,7 +16,7 @@ const volatile u64 cgrp_slice_ns;
 const volatile bool fifo_sched;
 const volatile u64 task_slice_ns;
 
-const u32 NR_CPUS_LOG = 4;
+const u32 NR_CPUS_LOG = 2;
 
 u64 cvtime_now;
 UEI_DEFINE(uei);
@@ -407,11 +407,12 @@ static void cgrp_dispatch_stat( __u64 cgid, struct fcg_cgrp_ctx* cgc, struct fcg
     __sync_fetch_and_add( &cg_stat->lat_cnt, 1 );
 
     __u64 lat_max = __sync_fetch_and_add( &cg_stat->lat_max, 0 );
-    if ( lat > (15 * 1000000 ) )// lat_max )
+    if ( lat > (15 * 1000000 ) || lat > lat_max )
     {
         __u64 lat_ms = lat / 1000000;
 
-        if ( cgc->rt_class ) log("\tcgrp_dispatch_stat: lat = %llu, NEW MAX!", cgc->rt_class, lat_ms);
+        //if ( cgc->rt_class ) 
+            log("\tcgrp_dispatch_stat: lat = %llu (rt_class = %d), NEW MAX!", cgc->rt_class, lat_ms, cgc->rt_class);
 
         __sync_val_compare_and_swap( &cg_stat->lat_max, lat_max, lat );
     }
@@ -959,11 +960,10 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         u64 cgid = cgrp->kn->id;
 
+        cgrp_enqueue_stat( cgrp, cgc, false, p->pid );
+
         // Credit once per DSQ residency
-        if ( increment_enq_count( taskc, cgc, cgid ) )
-        {
-            cgrp_enqueue_stat( cgrp, cgc, false, p->pid );
-        }
+        increment_enq_count( taskc, cgc, cgid );
 
         bool is_idle = false;
         bool can_kick = false;
@@ -995,12 +995,18 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             }
     
             cgrp_enqueue_stat( cgrp, cgc, true, p->pid );
-            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
             scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
+
+            bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
+
             goto out_release;
         }
         else
         {
+
+            log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
+
             cgrp_enqueued(cgrp, cgc);
 
             scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
@@ -1165,9 +1171,15 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
     s32 cpu = (s32)bpf_get_smp_processor_id();
     cgc = find_cgrp_ctx(cgrp);
 
+
+    log("SCX_EVT run_start tid=%d cgid=%llu cpu=%d ts_ns=%llu", 
+        (cgc ? cgc->rt_class : 0), p->pid, sel_id,
+        cpu, scx_bpf_now());
+
+
     log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
 
-    bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
+    //bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
 
     if (cgc) 
     {
@@ -1248,6 +1260,8 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     }
 
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+
+    u64 cgid = cgrp ? cgrp->kn->id : 0;
     cgc = find_cgrp_ctx(cgrp);
     if (cgc) {
         rt_class = cgc->rt_class;
@@ -1270,6 +1284,10 @@ log_and_out:
     {
         if (!runnable) 
         {    
+            log("SCX_EVT run_stop  tid=%d cgid=%llu cpu=%d ts_ns=%llu",
+                (cgc ? cgc->rt_class : 0), p->pid, cgid,
+                cpu, scx_bpf_now());
+
             log("\tstopping: sleep pid %d comm %s on cpu %d (cur_cgid[cpu=%d] cleared)", rt_class, p->pid, p->comm, cpu, cpu);
             dump_cur_cgid(0, rt_class);
         }
@@ -1447,6 +1465,8 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     if (scx_bpf_dsq_move_to_local(cgid))
     {
         cgrp_dispatch_stat( cgid, cgc, cpuc );
+
+        bpf_map_update_elem(&cur_cgid, &cpu, &cgid, BPF_ANY);
 
         //if ( enq_count > 0 ) __sync_sub_and_fetch(&cgc->enq_count, 1);   
     }
@@ -1646,6 +1666,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 pick_next_cgroup:
     cpuc->cur_at = now;
     cpuc->cur_cgid = 0;
+    bpf_map_update_elem(&cur_cgid, &cpu, &cpuc->cur_cgid, BPF_ANY);
 
     u32 fallback_q = scx_bpf_dsq_nr_queued(FALLBACK_DSQ);
     if (scx_bpf_dsq_move_to_local(FALLBACK_DSQ)) {

@@ -172,8 +172,8 @@ restart:
 
 	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
 	assert(skel->rodata->nr_cpus > 0);
-	skel->rodata->cgrp_slice_ns =  20000000;//__COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
-	skel->rodata->task_slice_ns =  20000000;//__COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
+	skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
+	skel->rodata->task_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
 
 	printf("slice=%.1lfms intv=%.1lfs dump_cgrps=%d",
 	       (double)skel->rodata->cgrp_slice_ns / 1000000.0,
