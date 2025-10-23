@@ -92,7 +92,9 @@ __uint(max_entries, 1024);
 
 struct fcg_task_ctx {
     u64		bypassed_at;
-    u64  enq_cgid;       // cgroup we credited enq_count to
+    u64     enq_cgid;       // cgroup we credited enq_count to
+    u8      rt_class;
+    s32     sel_cpu;
 };
 
 struct cls_counters {
@@ -153,6 +155,8 @@ static __always_inline bool increment_enq_count( struct fcg_task_ctx *taskc, str
     // Win once per residency: 0 -> cgid
     if (__sync_val_compare_and_swap(&taskc->enq_cgid, 0, cgid) == 0) 
     {
+        taskc->rt_class = cgc->rt_class;
+
         u64 old = __sync_fetch_and_add(&cgc->enq_count, 1);
     
         if ( 0 == old )
@@ -166,18 +170,37 @@ static __always_inline bool increment_enq_count( struct fcg_task_ctx *taskc, str
     return false;
 }
 
-static __always_inline void decrement_enq_count( struct fcg_task_ctx *taskc, struct fcg_cgrp_ctx *cgc, u64 cgid)
+static __always_inline void decrement_enq_count( struct fcg_task_ctx *taskc, struct fcg_cgrp_ctx *cgc, u64 cgid )
 {
-    if (!taskc || !cgc) return;
+    if (!taskc || !cgc ) return;
 
-    // Win once per residency: cgid -> 0 
-    if (__sync_val_compare_and_swap(&taskc->enq_cgid, cgid, 0) == cgid) 
+    u64 task_cgid = taskc->enq_cgid;
+
+    // Win once per residency: cgid -> 0
+    u64 enq_cgid = __sync_val_compare_and_swap(&taskc->enq_cgid, task_cgid, 0);
+
+    if ( 0 != enq_cgid && enq_cgid == task_cgid ) 
     {
-        u64 old = __sync_fetch_and_sub(&cgc->enq_count, 1);
-        
-        if ( 1 == old )
+        // Make sure we decrement the actual cgc which had been incremented (and be move agnostic)
+        if ( enq_cgid != cgid )
         {
-            cls_dec(cgc->rt_class);
+            log("\tdecrement_enq_count: CGID (%llu) != taskc->enq_cgid (%llu) when decrementing enq_count!", 1, cgid, taskc->enq_cgid);
+            struct cgroup *cg = bpf_cgroup_from_id(enq_cgid);
+            if ( cg )
+            {
+                cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
+                bpf_cgroup_release(cg);
+            }
+        }
+
+        if ( cgc )
+        {
+            u64 old = __sync_fetch_and_sub(&cgc->enq_count, 1);
+            
+            if ( 1 == old )
+            {
+                cls_dec(taskc->rt_class);
+            }
         }
     }
 }
@@ -295,7 +318,7 @@ static void dump_cur_cgid(int start, int rt_class)
 static __always_inline bool str_is_hw(const char *s)
 {
     /* exact "hw" */
-    return s[0] == 'h' && s[1] == 'w' && s[2] == '\0';
+    return s[0] == 'h' && s[1] == 'w';// && s[2] == '\0';
 }
 
 // Check if cgroup is "hw" OR its parent cgroup is "hw"
@@ -793,102 +816,60 @@ static __always_inline s32 pick_cpu_to_kick_for_rt(struct task_struct *p, bool *
     }
 
     // No BK found; return some allowed CPU (already running RT). Never return nr_cpus unless mask empty.
+    //return nr_cpus;
+    
     return first_allowed;
 }
 
 s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
+    //return 1;
     bool is_idle = false;
 
-    // TEMPORARILY DISABLED FOR SIMPLER TESTING. WE CALL THE DEFAULT FUNCTION DIRECTLY AT THE END.
+    struct fcg_task_ctx * taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (!taskc) {
+        scx_bpf_error("task_ctx lookup failed");
+        return prev_cpu;
+    }
+    //taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, &is_idle, &is_idle);
+    //return taskc->sel_cpu;
 
-    //struct cgroup *cgrp;
-    //struct fcg_cgrp_ctx *cgc;
-    ////struct fcg_task_ctx *taskc;
-    //s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-    //taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    //if (!taskc) {
-    //    scx_bpf_error("task_ctx lookup failed");
-    //    return cpu;
-    //}
-    //cgrp = __COMPAT_scx_bpf_task_cgroup(p);
-    //if (cgrp) {
-    //    cgc = find_cgrp_ctx(cgrp);
-    //
-    //    if ( cgc )
-    //    {
-    //        cgrp_enqueued(cgrp, cgc);
-    //
-    //        if (cgc->rt_class) {
-    //
-    //            u64 tvtime = p->scx.dsq_vtime;
-    //
-    //            /*
-    //            * Limit the amount of budget that an idling task can accumulate
-    //            * to one slice.
-    //            */
-    //            if (time_before(tvtime, cgc->tvtime_now - task_slice_ns))
-    //                tvtime = cgc->tvtime_now - task_slice_ns;
-    //
-    //            bool is_idle = false;
-    //            s32 tgt = pick_cpu_to_kick_for_rt(p, &is_idle);
-    //            if (tgt >= 0 && tgt < nr_cpus)
-    //            {
-    //                if ( is_idle )
-    //                {
-    //                    log("\tfcg_select_cpu: kick IDLE CPU %d for pid %d", 0, tgt, p->pid);
-    //                    scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-    //                }
-    //                else
-    //                {
-    //                    log("\tfcg_select_cpu: kick PREEMPT CPU %d for pid %d ", 0, tgt, p->pid);
-    //                    scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
-    //                }
-    //
-    //                log("\tfcg_select_cpu: RT enqueue task %d (cgroup %llu) to cpu %d", 0, p->pid, cgrp->kn->id, tgt);
-    //
-    //                scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, SCX_ENQ_WAKEUP | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
-    //
-    //                bpf_cgroup_release( cgrp );
-    //
-    //                return tgt;
-    //            }
-    //
-    //            log("\tfcg_select_cpu: RT enqueue task %d (cgroup %llu)", 0, p->pid, cgrp->kn->id );
-    //
-    //            scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, SCX_ENQ_WAKEUP | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
-    //        }
-    //    }
-    //
-    //    bpf_cgroup_release( cgrp );
-    //}
+    s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    if ( is_idle )
+    {
+        //scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL, task_slice_ns, wake_flags );
+        taskc->sel_cpu = cpu % 2;
+    }
+    else
+    {
+        taskc->sel_cpu = prev_cpu;
+        // taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, &is_idle, &is_idle);
 
-    //
-    //If select_cpu_dfl() is recommending local enqueue, the target CPU is
-    //idle. Follow it and charge the cgroup later in fcg_stopping() after
-    //the fact.
-    //
+        // struct cgroup * cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+        // if ( cgrp )
+        // {
+        //     u64 cgid = cgrp->kn->id;
 
-    //if (is_idle) {
+        //     bpf_map_update_elem(&cur_cgid, &taskc->sel_cpu, &cgid, BPF_ANY);
 
-        //set_bypassed_at(p, taskc);
-        //stat_inc(FCG_STAT_LOCAL);
-        //scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice_ns, 0);
+        //     bpf_cgroup_release(cgrp);
+        // }
+    }
 
-        //cgrp = __COMPAT_scx_bpf_task_cgroup(p);
-        //if (cgrp) {
-        //    cgc = find_cgrp_ctx(cgrp);
-        //    if (cgc && cgc->rt_class) {
-        //        set_bypassed_at(p, taskc);
-        //        stat_inc(FCG_STAT_LOCAL);
-        //        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice_ns, 0);
-        //    }
-        //
-        //    bpf_cgroup_release(cgrp);
-        //}
-    //}
+    return taskc->sel_cpu;
 
-    return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);;
+    // if (is_idle)
+    // {
+    //     scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL, task_slice_ns, wake_flags );
+    //     log("\tfcg_select_cpu: returning IDLE cpu %d for pid %d", 1, cpu, p->pid);
+    //     return cpu;
+    // }
+    // else 
+    // {
+    //     log("\tfcg_select_cpu: returning cpu 1 for pid %d", 1, p->pid);
+    // }
+
+    // return 1;
 }
 
 static __always_inline void fcg_log_enq_flags(const char *tag,
@@ -962,17 +943,18 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         cgrp_enqueue_stat( cgrp, cgc, false, p->pid );
 
-        // Credit once per DSQ residency
-        increment_enq_count( taskc, cgc, cgid );
-
         bool is_idle = false;
         bool can_kick = false;
         s32 tgt = nr_cpus;
 
         if ( cgc->rt_class )
         {
-            is_idle = !cgc->rt_class;
-            tgt = pick_cpu_to_kick_for_rt(p, &is_idle, &can_kick);
+            //tgt = taskc->sel_cpu;
+            if ( taskc->sel_cpu != nr_cpus )
+               tgt = taskc->sel_cpu;
+            else
+               tgt = pick_cpu_to_kick_for_rt(p, &is_idle, &can_kick);
+            //if ( tgt == nr_cpus ) tgt = taskc->sel_cpu;
         }
 
 #ifdef DIR_ENQ
@@ -980,6 +962,12 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         {
             set_bypassed_at(p, taskc);
 
+            cgrp_enqueue_stat( cgrp, cgc, true, p->pid );
+            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
+            scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
+
+            bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
+            
             if ( can_kick )
             {
                 if ( is_idle )
@@ -993,21 +981,17 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
                     scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
                 }
             }
-    
-            cgrp_enqueue_stat( cgrp, cgc, true, p->pid );
-            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
-            scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
-
-            bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
 
             goto out_release;
         }
         else
         {
-
             log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
 
             cgrp_enqueued(cgrp, cgc);
+
+            // Credit once per DSQ residency
+            increment_enq_count( taskc, cgc, cgid );
 
             scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
         }
@@ -1675,10 +1659,10 @@ pick_next_cgroup:
     }
 
     // TEMPORARY DISABLED FOR SIMPLER TESTING
-    //if (cls_get_rt() == 0) {
+    if (cls_get_rt() == 0) {
         // skip probing the RT tree this round and go straight to BK
-    //    goto pick_from_BG;
-    //}
+        goto pick_from_BG;
+    }
 
     if ( cpu < NR_CPUS_LOG ) 
         log("\tfcg_dispatch: pick_next_cgroup trying to move RT to local (size %u) on cpu %d", 1, cls_get_rt(), cpu);
@@ -1696,7 +1680,7 @@ pick_next_cgroup:
 
 pick_from_BG:
 
-    //if ( cls_get_bk() != 0 )
+    if ( cls_get_bk() != 0 )
     {
         if ( cpu < NR_CPUS_LOG )
             log("\tfcg_dispatch: pick_next_cgroup trying to move BK to local (size %u) on cpu %d", 0, cls_get_bk(), cpu);
@@ -1711,11 +1695,11 @@ pick_from_BG:
             //break;
         //}
     }
-    /*else
+    else
     {
         if ( cpu < NR_CPUS_LOG )
             log("\t\t\tfcg_dispatch: both trees are empty when called for cpu %d???", 0, cpu);
-    }*/
+    }
 
 
     /*
@@ -1855,8 +1839,11 @@ void BPF_STRUCT_OPS(fcg_cgroup_move, struct task_struct *p,
     if (!(from_cgc = find_cgrp_ctx(from)) || !(to_cgc = find_cgrp_ctx(to)))
         return;
 
-    struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    decrement_enq_count( taskc, from_cgc, from->kn->id );
+    log("\tfcg_cgroup_move: moving task %d from cgroup %llu to cgroup %llu!!!", 1, p->pid, from->kn->id, to->kn->id);
+
+
+    //struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    //decrement_enq_count( taskc, from_cgc, from->kn->id );
 
 
     delta = time_delta(p->scx.dsq_vtime, from_cgc->tvtime_now);
