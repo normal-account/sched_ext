@@ -16,7 +16,7 @@ const volatile u64 cgrp_slice_ns;
 const volatile bool fifo_sched;
 const volatile u64 task_slice_ns;
 
-const u32 NR_CPUS_LOG = 2;
+const u32 NR_CPUS_LOG = 4;
 
 u64 cvtime_now;
 UEI_DEFINE(uei);
@@ -746,14 +746,14 @@ static bool cpu_running_bk(s32 cpu)
     if (!cgidp || !*cgidp)         // 0 => idle/fallback/unknown: treat as BK
     {
         log("\t\tcpu_running_bk: idle/fallback/unknown (!cgidp || !*cgidp): treat as BK", 0);
-        return true;
+        return false;
     }
 
     struct cgroup *cg = bpf_cgroup_from_id(*cgidp);
     if (!cg)
     {
         log("\t\tcpu_running_bk: cgroup raced away (!cg), don’t block the kick: treat as BK", 0);
-        return true;          // cgroup raced away, don’t block the kick
+        return false;          // cgroup raced away, don’t block the kick
     }
     struct fcg_cgrp_ctx *cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
     u32 is_bk = (!cgc || cgc->rt_class == 0);
@@ -761,69 +761,109 @@ static bool cpu_running_bk(s32 cpu)
     return is_bk;
 }
 
-static __always_inline s32 pick_cpu_to_kick_for_rt(struct task_struct *p, bool *is_idle, bool *can_kick)
+static __always_inline u32 cpu_load_for_pick(u32 cpu)
+{
+    u32 nr_q = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
+    u32 running = 0;
+    u64 *cgidp = bpf_map_lookup_elem(&cur_cgid, &cpu);
+    if (cgidp && *cgidp) running = 1;
+    return nr_q + running;
+}
+
+enum cpu_runcls { CPU_IDLING = 0, CPU_BK, CPU_RT };
+
+static __always_inline enum cpu_runcls cpu_cls(u32 cpu)
+{
+    u64 *cgidp = bpf_map_lookup_elem(&cur_cgid, &cpu);
+    if (!cgidp || !*cgidp) return CPU_IDLING;
+
+    struct cgroup *cg = bpf_cgroup_from_id(*cgidp);
+    if (!cg) return CPU_BK; // be conservative; allow preempting it
+    struct fcg_cgrp_ctx *cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
+    u8 is_rt = (cgc && cgc->rt_class);
+    bpf_cgroup_release(cg);
+    return is_rt ? CPU_RT : CPU_BK;
+}
+
+static __always_inline void set_flags_from_cls(enum cpu_runcls cls, bool *is_idle, bool *can_kick)
+{
+    *is_idle = (cls == CPU_IDLING);
+    *can_kick = (cls == CPU_BK);
+}
+
+static __always_inline s32 pick_cpu_to_kick_for_rt(struct task_struct *p, s32 hint_cpu, bool *is_idle, bool *can_kick)
 {
     if (!is_idle || !can_kick) return nr_cpus;
+    *is_idle = false;
+    *can_kick = false;
 
     const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
+    u32 n = nr_cpus;
 
-    // 1) Prefer idle within affinity
+    // 1) hard prefer idle
     s32 cpu = scx_bpf_pick_idle_cpu(allowed, 0);
-    if (cpu >= 0) {
-        *is_idle  = true;
-        *can_kick = true;
-        return cpu;
+    if (cpu >= 0) { *is_idle = true; return cpu; }
+
+    // 2) scan once in pseudo-random order
+    u32 start = bpf_get_prandom_u32() % (n ?: 1);
+    u32 step  = (bpf_get_prandom_u32() | 1) % (n ?: 1); if (!step) step = 1;
+
+    s32 best_bk = nr_cpus; u32 best_bk_load = ~0u;
+    s32 best_rt = nr_cpus; u32 best_rt_load = ~0u;
+
+    // Precompute hint properties if usable
+    bool hint_ok = (hint_cpu >= 0) && ((u32)hint_cpu < n) &&
+                   bpf_cpumask_test_cpu(hint_cpu, allowed);
+    enum cpu_runcls hint_cls = CPU_RT; u32 hint_load = 0;
+    if (hint_ok) {
+        hint_cls  = cpu_cls((u32)hint_cpu);
+        if (hint_cls == CPU_IDLING) { *is_idle = true; return hint_cpu; }  // race: take idle hint immediately
+        hint_load = cpu_load_for_pick((u32)hint_cpu);
     }
 
-    // 2) Single pass over CPUs in pseudo-random order (random start + odd stride)
-    u32 n      = nr_cpus;
-    u32 start  = bpf_get_prandom_u32() % (n ?: 1);
-    u32 step   = (bpf_get_prandom_u32() | 1) % (n ?: 1);  // odd; for n==1 becomes 0, fixed below
-    if (step == 0) step = 1;
-
-    s32 first_allowed = nr_cpus;  // fallback if no BK
-
     u32 idx = start;
-
 #pragma clang loop unroll(disable)
     for (int k = 0; k < 1024; k++) {
         if ((u32)k >= n) break;
+        if (!bpf_cpumask_test_cpu((s32)idx, allowed)) goto next;
 
-        if (bpf_cpumask_test_cpu((s32)idx, allowed)) {
-            if (first_allowed == nr_cpus)
-                first_allowed = (s32)idx;
+        enum cpu_runcls cls = cpu_cls(idx);
+        if (cls == CPU_IDLING) { *is_idle = true; return (s32)idx; } // race: found idle
 
-            if (!cpu_running_rt((s32)idx)) {
-                *can_kick = true;          // PREEMPT kick ok
-                log("\tpick_cpu_to_kick_for_rt: picked BK CPU %d to kick for pid %d", 1, idx, p->pid);
-                return (s32)idx;
-            }
+        u32 load = cpu_load_for_pick(idx);
+        if (cls == CPU_BK && load < best_bk_load) { best_bk = (s32)idx; best_bk_load = load; }
+        if (cls == CPU_RT && load < best_rt_load) { best_rt = (s32)idx; best_rt_load = load; }
+
+    next:
+        idx += step; if (idx >= n) idx -= n;
+    }
+
+    // 3) Prefer BK, and choose hint if exact load tie with hint (and hint is BK), 
+    if (best_bk != nr_cpus) {
+        if (hint_ok && hint_cls == CPU_BK && hint_load == best_bk_load) {
+            set_flags_from_cls(hint_cls, is_idle, can_kick);
+            return hint_cpu;
         }
-
-        // idx = (idx + step) % n;  // avoid % to keep the verifier happy
-        idx += step;
-        if (idx >= n) idx -= n;
+        set_flags_from_cls(CPU_BK, is_idle, can_kick);
+        return best_bk;
     }
 
-    if ( first_allowed == nr_cpus ) 
-    {   
-        log("\tpick_cpu_to_kick_for_rt: WARNING, DID NOT FIND A VALID BK CPU for pid %d", 1, p->pid);
-    }
-    else 
-    {
-        //*can_kick = true;
-        log("\tpick_cpu_to_kick_for_rt: picked CPU %d already running RT for pid %d", 1, first_allowed, p->pid);
+    // 4) Fall back to least-loaded RT, and tie-break to hint if same load & hint is RT
+    if (best_rt != nr_cpus) {
+        if (hint_ok && hint_cls == CPU_RT && hint_load == best_rt_load) {
+            set_flags_from_cls(hint_cls, is_idle, can_kick);
+            return hint_cpu;
+        }
+        set_flags_from_cls(CPU_RT, is_idle, can_kick);
+        return best_rt;
     }
 
-    // No BK found; return some allowed CPU (already running RT). Never return nr_cpus unless mask empty.
-    //return nr_cpus;
-    
-    return first_allowed;
+    // 5) No allowed CPUs (mask empty / extreme race)
+    return nr_cpus;
 }
 
 s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-    //return 1;
     bool is_idle = false;
 
     struct fcg_task_ctx * taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
@@ -831,45 +871,27 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
         scx_bpf_error("task_ctx lookup failed");
         return prev_cpu;
     }
-    //taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, &is_idle, &is_idle);
-    //return taskc->sel_cpu;
 
-    s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-    if ( is_idle )
+    struct cgroup *cgrp;
+    struct fcg_cgrp_ctx *cgc;
+
+    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgc = find_cgrp_ctx(cgrp);
+    bpf_cgroup_release(cgrp);
+
+    if ( true || ( cgc && cgc->rt_class)  )
     {
-        //scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL, task_slice_ns, wake_flags );
-        taskc->sel_cpu = cpu % 2;
+        taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, prev_cpu, &is_idle, &is_idle);
+        //taskc->sel_cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+
+        log("\tfcg_select_cpu: returning cpu %d for pid %d", 1, taskc->sel_cpu, p->pid);
+
+        return taskc->sel_cpu;
     }
-    else
+    else 
     {
-        taskc->sel_cpu = prev_cpu;
-        // taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, &is_idle, &is_idle);
-
-        // struct cgroup * cgrp = __COMPAT_scx_bpf_task_cgroup(p);
-        // if ( cgrp )
-        // {
-        //     u64 cgid = cgrp->kn->id;
-
-        //     bpf_map_update_elem(&cur_cgid, &taskc->sel_cpu, &cgid, BPF_ANY);
-
-        //     bpf_cgroup_release(cgrp);
-        // }
+        return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     }
-
-    return taskc->sel_cpu;
-
-    // if (is_idle)
-    // {
-    //     scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL, task_slice_ns, wake_flags );
-    //     log("\tfcg_select_cpu: returning IDLE cpu %d for pid %d", 1, cpu, p->pid);
-    //     return cpu;
-    // }
-    // else 
-    // {
-    //     log("\tfcg_select_cpu: returning cpu 1 for pid %d", 1, p->pid);
-    // }
-
-    // return 1;
 }
 
 static __always_inline void fcg_log_enq_flags(const char *tag,
@@ -949,12 +971,32 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         if ( cgc->rt_class )
         {
-            //tgt = taskc->sel_cpu;
-            if ( taskc->sel_cpu != nr_cpus )
-               tgt = taskc->sel_cpu;
+            const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
+
+            bool sel_cpu_allowed =  bpf_cpumask_test_cpu(taskc->sel_cpu, allowed);
+
+            if ( ( enq_flags & SCX_ENQ_REENQ ) == 0 && sel_cpu_allowed )
+            {
+                tgt = taskc->sel_cpu;
+
+                enum cpu_runcls cls = cpu_cls(tgt);
+
+                if ( CPU_IDLING == cls )
+                    is_idle = true;
+                else if ( CPU_BK == cls )
+                    can_kick = true;
+            }
             else
-               tgt = pick_cpu_to_kick_for_rt(p, &is_idle, &can_kick);
-            //if ( tgt == nr_cpus ) tgt = taskc->sel_cpu;
+            {
+                tgt = pick_cpu_to_kick_for_rt(p, nr_cpus, &is_idle, &can_kick);
+
+                //if ( !is_idle && sel_cpu_allowed )
+                //{
+                //    tgt = taskc->sel_cpu;
+                //}
+
+                stat_inc(FCG_STAT_PNC_AFFINITY);
+            }
         }
 
 #ifdef DIR_ENQ
@@ -963,23 +1005,22 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             set_bypassed_at(p, taskc);
 
             cgrp_enqueue_stat( cgrp, cgc, true, p->pid );
-            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
+            //u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | ( ( is_idle || can_kick ) ? SCX_ENQ_HEAD : 0 ); //| SCX_ENQ_PREEMPT;
+            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;
+            
             scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
 
-            bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
+            //bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
             
-            if ( can_kick )
+            if ( is_idle )
             {
-                if ( is_idle )
-                {
-                    log("\tfcg_enqueue: direct kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
-                    scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-                }
-                else
-                {
-                    log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
-                    scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
-                }
+                log("\tfcg_enqueue: direct kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
+                scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
+            }
+            else if ( can_kick )
+            {
+                log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
+                scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
             }
 
             goto out_release;
@@ -1163,7 +1204,7 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
 
     log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
 
-    //bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
+    bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
 
     if (cgc) 
     {
@@ -1484,7 +1525,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
             return true;
         }
 
-        stat_inc(FCG_STAT_PNC_AFFINITY);
+        //stat_inc(FCG_STAT_PNC_AFFINITY);
         bpf_cgroup_release(cgrp);
         return false;
     }

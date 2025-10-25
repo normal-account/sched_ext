@@ -32,7 +32,7 @@ vmlinux:
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 
 start: stop
-	./clear_traces.sh
+	# ./clear_traces.sh
 	sudo bpftool struct_ops register $(SCHED_NAME).o /sys/fs/bpf/sched_ext
 
 stop:
