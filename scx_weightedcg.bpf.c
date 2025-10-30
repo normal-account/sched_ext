@@ -752,7 +752,7 @@ static bool cpu_running_bk(s32 cpu)
     struct cgroup *cg = bpf_cgroup_from_id(*cgidp);
     if (!cg)
     {
-        log("\t\tcpu_running_bk: cgroup raced away (!cg), don’t block the kick: treat as BK", 0);
+        log("\t\tcpu_running_bk: cgroup raced away (!cg), don't block the kick: treat as BK", 0);
         return false;          // cgroup raced away, don’t block the kick
     }
     struct fcg_cgrp_ctx *cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
@@ -800,11 +800,11 @@ static __always_inline s32 pick_cpu_to_kick_for_rt(struct task_struct *p, s32 hi
     const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
     u32 n = nr_cpus;
 
-    // 1) hard prefer idle
-    s32 cpu = scx_bpf_pick_idle_cpu(allowed, 0);
-    if (cpu >= 0) { *is_idle = true; return cpu; }
+    // 1) Hard prefer idle
+    //s32 cpu = scx_bpf_pick_idle_cpu(allowed, 0);
+    //if (cpu >= 0) { *is_idle = true; return cpu; }
 
-    // 2) scan once in pseudo-random order
+    // 2) Scan once in pseudo-random order
     u32 start = bpf_get_prandom_u32() % (n ?: 1);
     u32 step  = (bpf_get_prandom_u32() | 1) % (n ?: 1); if (!step) step = 1;
 
