@@ -77,16 +77,32 @@ struct fcg_cgrp_stats {
 	u32			weight;
 };
 
+struct fcg_buddy_key {
+    __u32 pid;       // waiter
+    __u32 buddy;     // inferred dependency (buddy)
+};
+
+struct fcg_buddy_val {
+    __u64 cnt;       // times 'buddy' was recorded for 'pid'
+    __u64 last_ts;   // scx_bpf_now() of last increment (debug)
+    __u32 last_cpu;  // CPU when we last incremented (debug)
+    __u32 _pad;
+};
+
 #ifndef DIR_ENQ
 #define DIR_ENQ 1
 #endif
 
 #ifndef FCG_DEBUG
-//#define FCG_DEBUG 1
+#define FCG_DEBUG 1
+#endif
+
+#ifndef FCG_BUDDIES
+#define FCG_BUDDIES 0
 #endif
 
 #if FCG_DEBUG
-#define log(fmt, rt_class, ...) if ( true || rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
 #endif

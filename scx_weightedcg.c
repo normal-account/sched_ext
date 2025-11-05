@@ -80,6 +80,99 @@ static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel)
 	}
 }
 
+struct buddy_row {
+    uint32_t pid;
+    uint32_t buddy;
+    uint64_t cnt;
+    uint64_t last_ts;
+    uint32_t last_cpu;
+};
+
+
+static int cmp_buddy_row(const void *a, const void *b) {
+    const struct buddy_row *x = (const struct buddy_row *)a;
+    const struct buddy_row *y = (const struct buddy_row *)b;
+    if (x->pid   != y->pid)   return (x->pid   < y->pid)   ? -1 : 1;
+    if (x->buddy != y->buddy) return (x->buddy < y->buddy) ? -1 : 1;
+    return 0;
+}
+
+static inline double ns_to_s(uint64_t ns) { return (double)ns / 1e9; }
+
+static void fcg_read_task_stats(struct scx_weightedcg_bpf *skel)
+{
+	int fd = bpf_map__fd(skel->maps.buddy_stats);
+
+    struct buddy_row *rows = NULL;
+    size_t n = 0, cap = 0;
+
+    struct fcg_buddy_key cur_key, next_key;
+    struct fcg_buddy_val val;
+    int ret;
+
+    // Iterate all keys
+    memset(&cur_key, 0, sizeof(cur_key));
+    ret = bpf_map_get_next_key(fd, NULL, &next_key);
+    while (ret == 0) {
+        if (bpf_map_lookup_elem(fd, &next_key, &val) == 0) {
+            if (n == cap) {
+                cap = cap ? cap * 2 : 1024;
+                rows = (struct buddy_row *)realloc(rows, cap * sizeof(*rows));
+                if (!rows) {
+                    perror("realloc");
+                    return;
+                }
+            }
+            rows[n++] = (struct buddy_row){
+                .pid      = next_key.pid,
+                .buddy    = next_key.buddy,
+                .cnt      = val.cnt,
+                .last_ts  = val.last_ts,
+                .last_cpu = val.last_cpu,
+            };
+        }
+        cur_key = next_key;
+        ret = bpf_map_get_next_key(fd, &cur_key, &next_key);
+    }
+
+    if (n == 0) {
+        printf("(buddy_stats empty)\n");
+        free(rows);
+        return;
+    }
+
+    // Sort: pid ASC, buddy ASC
+    qsort(rows, n, sizeof(*rows), cmp_buddy_row);
+
+    // Pretty, indented print
+    uint32_t cur_pid = UINT32_MAX;
+    uint64_t subtotal = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (rows[i].pid != cur_pid) {
+            // close previous block
+            if (cur_pid != UINT32_MAX) {
+                printf("    total_cnt: %llu\n", (unsigned long long)subtotal);
+                printf("\n");
+            }
+            cur_pid = rows[i].pid;
+            subtotal = 0;
+            printf("pid %u:\n", cur_pid);
+        }
+        subtotal += rows[i].cnt;
+        printf("  - buddy %-7u  cnt=%-8llu  last_cpu=%-2u  last_ts=%.6fs\n",
+               rows[i].buddy,
+               (unsigned long long)rows[i].cnt,
+               rows[i].last_cpu,
+               ns_to_s(rows[i].last_ts));
+    }
+    // close last block
+    if (cur_pid != UINT32_MAX) {
+        printf("    total_cnt: %llu\n", (unsigned long long)subtotal);
+    }
+
+    free(rows);
+}
 
 static float read_cpu_util(__u64 *last_sum, __u64 *last_idle)
 {
@@ -229,6 +322,7 @@ restart:
 		       acc_stats[FCG_STAT_BAD_REMOVAL]);
 
 		fcg_read_cgrp_stats( skel );
+		fcg_read_task_stats( skel );
 		
 		fflush(stdout);
 
