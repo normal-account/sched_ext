@@ -6,7 +6,7 @@
 */
 enum {
     FALLBACK_DSQ		= 0,
-    CGROUP_MAX_RETRIES	= 8,
+    CGROUP_MAX_RETRIES	= 128,
 };
 
 char _license[] SEC("license") = "GPL";
@@ -16,7 +16,7 @@ const volatile u64 cgrp_slice_ns;
 const volatile bool fifo_sched;
 const volatile u64 task_slice_ns;
 
-const u32 NR_CPUS_LOG = 4;
+const u32 NR_CPUS_LOG = 16;
 
 u64 cvtime_now;
 UEI_DEFINE(uei);
@@ -936,7 +936,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     {
         taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, prev_cpu, &is_idle, &is_idle);
 
-        log("\tfcg_select_cpu: returning cpu %d for pid %d", 0, taskc->sel_cpu, p->pid);
+        //log("\tfcg_select_cpu: returning cpu %d for pid %d", 0, taskc->sel_cpu, p->pid);
 
         return taskc->sel_cpu;
     }
@@ -1059,29 +1059,23 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             set_bypassed_at(p, taskc);
 
             cgrp_enqueue_stat( cgrp, cgc, true, p->pid );
-            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+            u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
             
             scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
 
             bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
-            
 
-            if ( is_idle || can_kick )
+            if ( is_idle && scx_bpf_test_and_clear_cpu_idle(tgt) )
+            {
+                log("\tfcg_enqueue: direct kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
+                scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
+                scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
+            }
+            else if ( can_kick || is_idle )
             {
                 log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
                 scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
             }
-
-            // if ( is_idle )
-            // {
-            //     log("\tfcg_enqueue: direct kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
-            //     scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-            // }
-            // else if ( can_kick )
-            // {
-            //     log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
-            //     scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
-            // }
 
             goto out_release;
         }
@@ -1539,11 +1533,30 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     }
 
     struct cpuset_bits *st = bpf_map_lookup_elem(&cpuset_map, &cgid);
-    if (!st || !st->init || !fcg_mask_test_cpu(st, (u32)cpu)) {
-        // Skip, this cgroup doesn't allow this CPU
-        log("\t\ttry_pick_next_cgroup: cgroup %llu not allowed on cpu %d (is RT tree %d)", (&cgv_tree_rt == cgv_tree) ? 1 : 0, cgid, cpu, &cgv_tree_rt == cgv_tree);
+    if (!st || !st->init || !fcg_mask_test_cpu(st, (u32)cpu)) 
+    {
+        // Head cgroup not allowed on this CPU: rotate head minimally.
+        log("\t\ttry_pick_next_cgroup: cgroup %llu not allowed on cpu %d (is RT tree %d)",
+            (&cgv_tree_rt == cgv_tree) ? 1 : 0, cgid, cpu, &cgv_tree_rt == cgv_tree);
+
+        bpf_spin_lock(&cgv_tree_lock);
+
+        // remove-first under the lock, but only if the head is the one we peeked
+        struct bpf_rb_node *removed = NULL;
+        struct cgv_node *bumped = NULL;
+
+        remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
+
+        if (removed && bumped) {
+            /* epsilon bump: reorder only, do NOT “charge” budget here */
+            bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+            bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
+        }
+
+        bpf_spin_unlock(&cgv_tree_lock);
+
         bpf_cgroup_release(cgrp);
-        return false;
+        return true;
     }
 
     u64 enq_count =__sync_fetch_and_add(&cgc->enq_count, 0);
@@ -1553,13 +1566,9 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         cgrp_dispatch_stat( cgid, cgc, cpuc );
 
         bpf_map_update_elem(&cur_cgid, &cpu, &cgid, BPF_ANY);
-
-        //if ( enq_count > 0 ) __sync_sub_and_fetch(&cgc->enq_count, 1);   
     }
     else
     {
-        //if ( enq_count > 0 ) enq_count = __sync_sub_and_fetch(&cgc->enq_count, 1);
-
         u32 qsz  = scx_bpf_dsq_nr_queued( cgid );
 
         if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, &cgv_tree_rt == cgv_tree, enq_count);
@@ -1586,9 +1595,37 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
             return true;
         }
 
-        //stat_inc(FCG_STAT_PNC_AFFINITY);
+
+        // Tasks exist (qsz > 0), but move_to_local returned 0.
+        // This means tasks are pinned to other CPUs. We must rotate the tree
+        // to avoid Head-of-Line blocking.
+        
+        log("\t\ttry_pick_next_cgroup: task affinity blocked cgid %llu on cpu %d - rotating", cgc->rt_class, cgid, cpu);
+
+        bpf_spin_lock(&cgv_tree_lock);
+
+        struct bpf_rb_node *removed = NULL;
+        struct cgv_node *bumped = NULL;
+
+        // Remove the node we peeked
+        remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
+
+        if (removed && bumped) {
+            /* * Charge a slice delta (or epsilon) to rotate it to the back 
+             * so we can get to the next cgroup. 
+             */
+            bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+            bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
+        }
+
+        bpf_spin_unlock(&cgv_tree_lock);
+        
         bpf_cgroup_release(cgrp);
-        return false;
+        return true; // Return true so fcg_dispatch loop tries the next node
+        
+        ////stat_inc(FCG_STAT_PNC_AFFINITY);
+        //bpf_cgroup_release(cgrp);
+        //return false;
     }
 
     /*
@@ -1670,7 +1707,8 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
     if (!cpuc)
         return;
 
-    if (true || !cpuc->cur_cgid)
+    //if (true || !cpuc->cur_cgid)
+    if (!cpuc->cur_cgid)
         goto pick_next_cgroup;
 
     if (time_before(now, cpuc->cur_at + cgrp_slice_ns)) {
@@ -1769,7 +1807,7 @@ pick_next_cgroup:
     if ( cpu < NR_CPUS_LOG ) 
         log("\tfcg_dispatch: pick_next_cgroup trying to move RT to local (size %u) on cpu %d", 1, cls_get_rt(), cpu);
 
-    //bpf_repeat(CGROUP_MAX_RETRIES) {
+    bpf_repeat(CGROUP_MAX_RETRIES) {
         if (try_pick_next_cgroup( &cpuc->cur_cgid, &cgv_tree_rt, cpu, cpuc )) {
             if (cpuc->cur_cgid)   // non-zero only when we actually moved a DSQ
             {
@@ -1778,7 +1816,7 @@ pick_next_cgroup:
             //break;
         }
        // break;
-    //}
+    }
 
 pick_from_BG:
 
@@ -1787,7 +1825,7 @@ pick_from_BG:
         if ( cpu < NR_CPUS_LOG )
             log("\tfcg_dispatch: pick_next_cgroup trying to move BK to local (size %u) on cpu %d", 0, cls_get_bk(), cpu);
 
-        //bpf_repeat(CGROUP_MAX_RETRIES) {
+        bpf_repeat(CGROUP_MAX_RETRIES) {
             if (try_pick_next_cgroup( &cpuc->cur_cgid, &cgv_tree_bk, cpu, cpuc )) {
                 if (cpuc->cur_cgid)   // non-zero only when we actually moved a DSQ
                 {
@@ -1795,7 +1833,7 @@ pick_from_BG:
                 }
             }
             //break;
-        //}
+        }
     }
     else
     {
@@ -1986,6 +2024,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)fcg_cgroup_move,
         .init			= (void *)fcg_init,
         .exit			= (void *)fcg_exit,
-        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT,// | SCX_OPS_SWITCH_PARTIAL,
-        .timeout_ms		= 0, //5000U,
+        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_SWITCH_PARTIAL,
+        .timeout_ms		= 5000U,
         .name			= "weightedcg");
