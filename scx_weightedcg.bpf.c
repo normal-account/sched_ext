@@ -6,7 +6,7 @@
 */
 enum {
     FALLBACK_DSQ		= 0,
-    CGROUP_MAX_RETRIES	= 128,
+    CGROUP_MAX_RETRIES	= 8,
 };
 
 char _license[] SEC("license") = "GPL";
@@ -572,6 +572,72 @@ static bool cgv_node_less(struct bpf_rb_node *a, const struct bpf_rb_node *b)
     return cgc_a->cvtime < cgc_b->cvtime;
 }
 
+#define FCG_DUMP_MAX_NODES 16
+
+
+static __always_inline void fcg_dump_bk_tree(void)
+{
+#ifdef FCG_DEBUG
+    struct cgv_node *nodes[FCG_DUMP_MAX_NODES];
+    int i, cnt = 0;
+    struct bpf_rb_root *root = &cgv_tree_bk;
+
+    /* 1) Take up to FCG_DUMP_MAX_NODES nodes out of the BK tree */
+    bpf_spin_lock(&cgv_tree_lock);
+
+#pragma clang loop unroll(full)
+    for (i = 0; i < FCG_DUMP_MAX_NODES; i++) {
+        struct bpf_rb_node *rb;
+        struct bpf_rb_node *removed;
+        struct cgv_node *node;
+
+        rb = bpf_rbtree_first(root);
+        if (!rb)
+            break;
+
+        removed = bpf_rbtree_remove(root, rb);
+        if (!removed)
+            break;
+
+        node = container_of(removed, struct cgv_node, rb_node);
+        nodes[i] = node;
+        cnt++;
+    }
+
+    bpf_spin_unlock(&cgv_tree_lock);
+
+    /* 2) Log outside the lock to avoid "function calls under lock" issues */
+#pragma clang loop unroll(full)
+    for (i = 0; i < FCG_DUMP_MAX_NODES; i++) {
+        if (i >= cnt)
+            break;
+
+        struct cgv_node *node = nodes[i];
+
+        /* First log argument is your "rt_class"/channel; use 0 for BK */
+        log("TREE_DEBUG_BK[%d] cgid=%llu cvtime=%llu",
+            0,          /* rt_class / channel */
+            i,
+            node->cgid,
+            node->cvtime);
+    }
+
+    /* 3) Re-insert the nodes to restore the BK tree exactly as it was */
+    bpf_spin_lock(&cgv_tree_lock);
+
+#pragma clang loop unroll(full)
+    for (i = 0; i < FCG_DUMP_MAX_NODES; i++) {
+        if (i >= cnt)
+            break;
+
+        struct cgv_node *node = nodes[i];
+        bpf_rbtree_add(root, &node->rb_node, cgv_node_less);
+    }
+
+    bpf_spin_unlock(&cgv_tree_lock);
+#endif
+}
+
 static struct fcg_cpu_ctx *find_cpu_ctx(void)
 {
     struct fcg_cpu_ctx *cpuc;
@@ -706,12 +772,6 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct fcg_cgrp_ctx *cgc)
     char cg_name_buf[32];
     bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp->kn->name);
 
-    /* paired with cmpxchg in try_pick_next_cgroup() */
-    if (__sync_val_compare_and_swap(&cgc->queued, 0, 1)) {
-        log("\tcgrp_enqueued: skip because cgc->queued == 1 for cgroup %s", cgc->rt_class, cg_name_buf);
-        stat_inc(FCG_STAT_ENQ_SKIP);
-        return;
-    }
 
     stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
     if (!stash) {
@@ -719,27 +779,44 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct fcg_cgrp_ctx *cgc)
         return;
     }
 
-    /* NULL if the node is already on the rbtree */
-    cgv_node = bpf_kptr_xchg(&stash->node, NULL);
-    if (!cgv_node) {
-        log("\tcgrp_enqueued: cancelled because stash->node is NULL (already on the rbtree) for cgroup %s", cgc->rt_class, cg_name_buf);
+    /* paired with cmpxchg in try_pick_next_cgroup() */
+    if (__sync_val_compare_and_swap(&cgc->queued, 0, 1)) {
+
+        cgv_node = bpf_kptr_xchg(&stash->node, NULL);
+        if (!cgv_node) {
+            log("\tcgrp_enqueued: skip because cgc->queued == 1 for cgid %llu (%s)", cgc->rt_class, cgid, cg_name_buf);
+            stat_inc(FCG_STAT_ENQ_SKIP);
+            return;
+        }
+    }
+    else
+    {
+        /* NULL if the node is already on the rbtree */
+        cgv_node = bpf_kptr_xchg(&stash->node, NULL);
+    }
+
+    if (!cgv_node) 
+    {
+        //__sync_val_compare_and_swap(&cgc->queued, 1, 0);
+
+        log("\tcgrp_enqueued: cancelled because stash->node is NULL (already on the rbtree) for cgid %llu (%s)", cgc->rt_class, cgid, cg_name_buf);
         stat_inc(FCG_STAT_ENQ_RACE);
         return;
     }
 
-    log("\tcgrp_enqueued: confirmed stash->node has been set to NULL for cgroup %s", cgc->rt_class, cg_name_buf);
+    log("\tcgrp_enqueued: confirmed stash->node has been set to NULL for cgid %llu (%s) with cvtime=%llu", cgc->rt_class, cgid, cg_name_buf, cgv_node->cvtime);
 
     bool is_hw = is_cgroup_hw(cgrp);
 
     if (is_hw)
     {
         cgc->rt_class = 1;
-        log("\tcgrp_enqueued: enqueue new cgroup %s to REAL-TIME tree!", cgc->rt_class, cg_name_buf);
+        log("\tcgrp_enqueued: enqueue new cgid %llu (%s) to REAL-TIME tree!", cgc->rt_class, cgid, cg_name_buf);
     }
     else
     {
         cgc->rt_class = 0;
-        log("\tcgrp_enqueued: enqueue new cgroup %s to BACKGROUND tree!", cgc->rt_class, cg_name_buf);
+        log("\tcgrp_enqueued: enqueue new cgid %llu (%s) to BACKGROUND tree!", cgc->rt_class, cgid, cg_name_buf);
     }
 
     bpf_spin_lock(&cgv_tree_lock);
@@ -755,6 +832,8 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct fcg_cgrp_ctx *cgc)
     }
 
     bpf_spin_unlock(&cgv_tree_lock);
+
+    fcg_dump_bk_tree();
 }
 
 static void set_bypassed_at(struct task_struct *p, struct fcg_task_ctx *taskc)
@@ -775,14 +854,14 @@ static u64 cpu_running_rt(s32 cpu)
     u64 *cgidp = bpf_map_lookup_elem(&cur_cgid, &k);
     if (!cgidp || !*cgidp)         // 0 => idle/fallback/unknown: treat as BK
     {
-        log("\t\tcpu_running_rt: idle/fallback/unknown (!cgidp || !*cgidp): treat as BK", 0);
+        //log("\t\tcpu_running_rt: idle/fallback/unknown (!cgidp || !*cgidp): treat as BK", 0);
         return 0;
     }
 
     struct cgroup *cg = bpf_cgroup_from_id(*cgidp);
     if (!cg)
     {
-        log("\t\tcpu_running_rt: cgroup raced away (!cg), don’t block the kick: treat as BK", 0);
+        //log("\t\tcpu_running_rt: cgroup raced away (!cg), don’t block the kick: treat as BK", 0);
         return 0;          // cgroup raced away, don’t block the kick
     }
     struct fcg_cgrp_ctx *cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
@@ -798,14 +877,14 @@ static bool cpu_running_bk(s32 cpu)
     u64 *cgidp = bpf_map_lookup_elem(&cur_cgid, &k);
     if (!cgidp || !*cgidp)         // 0 => idle/fallback/unknown: treat as BK
     {
-        log("\t\tcpu_running_bk: idle/fallback/unknown (!cgidp || !*cgidp): treat as BK", 0);
+        //log("\t\tcpu_running_bk: idle/fallback/unknown (!cgidp || !*cgidp): treat as BK", 0);
         return false;
     }
 
     struct cgroup *cg = bpf_cgroup_from_id(*cgidp);
     if (!cg)
     {
-        log("\t\tcpu_running_bk: cgroup raced away (!cg), don't block the kick: treat as BK", 0);
+        //log("\t\tcpu_running_bk: cgroup raced away (!cg), don't block the kick: treat as BK", 0);
         return false;          // cgroup raced away, don’t block the kick
     }
     struct fcg_cgrp_ctx *cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
@@ -1081,7 +1160,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         }
         else
         {
-            log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
+            log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d on cgid %llu", cgc->rt_class, tgt, p->pid, cgid);
 
             cgrp_enqueued(cgrp, cgc);
 
@@ -1110,7 +1189,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         }
 #endif
 
-        log("\tfcg_enqueue: enqueue task %d (cgroup %llu, q=%d) slice=%llu enq_count=%llu", cgc->rt_class, p->pid, cgrp->kn->id,
+        log("\tfcg_enqueue: enqueue task %d (cgid %llu, q=%d) slice=%llu enq_count=%llu", cgc->rt_class, p->pid, cgrp->kn->id,
             scx_bpf_dsq_nr_queued(cgrp->kn->id), cgrp_slice_ns, cgc->enq_count);
     }
 
@@ -1252,12 +1331,12 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
     cgc = find_cgrp_ctx(cgrp);
 
 
-    log("SCX_EVT run_start tid=%d cgid=%llu cpu=%d ts_ns=%llu", 
-        (cgc ? cgc->rt_class : 0), p->pid, sel_id,
-        cpu, scx_bpf_now());
+    //log("SCX_EVT run_start tid=%d cgid=%llu cpu=%d ts_ns=%llu", 
+    //    (cgc ? cgc->rt_class : 0), p->pid, sel_id,
+    //    cpu, scx_bpf_now());
 
 
-    log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
+    //log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
 
     bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
 
@@ -1457,8 +1536,11 @@ inline static void try_stash_node( u64 cgid, struct fcg_cgrp_ctx *cgc, struct bp
 
     struct cgv_node_stash *stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
 
-    if ( stash && 1 == __sync_val_compare_and_swap( &cgc->queued, 1, 0 )) 
+    //if ( stash && 1 == __sync_val_compare_and_swap( &cgc->queued, 1, 0 )) 
+    if ( stash )
     {
+        __sync_val_compare_and_swap( &cgc->queued, 1, 0 );
+        
         cgv_node = bpf_kptr_xchg(&stash->node, cgv_node);
         log("\tfcg_dispatch: STASHING node for cgid %llu on cpu %d", cgc->rt_class, cgid, cpu );
 
@@ -1536,7 +1618,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     if (!st || !st->init || !fcg_mask_test_cpu(st, (u32)cpu)) 
     {
         // Head cgroup not allowed on this CPU: rotate head minimally.
-        log("\t\ttry_pick_next_cgroup: cgroup %llu not allowed on cpu %d (is RT tree %d)",
+        log("\t\ttry_pick_next_cgroup: cgid %llu not allowed on cpu %d (is RT tree %d)",
             (&cgv_tree_rt == cgv_tree) ? 1 : 0, cgid, cpu, &cgv_tree_rt == cgv_tree);
 
         bpf_spin_lock(&cgv_tree_lock);
@@ -1549,7 +1631,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
         if (removed && bumped) {
             /* epsilon bump: reorder only, do NOT “charge” budget here */
-            bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+            //bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
             bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
         }
 
@@ -1571,8 +1653,9 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     {
         u32 qsz  = scx_bpf_dsq_nr_queued( cgid );
 
-        if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, &cgv_tree_rt == cgv_tree, enq_count);
+        //if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, &cgv_tree_rt == cgv_tree, enq_count);
 
+        //if ( qsz == 0 && enq_count == 0 )
         if ( qsz == 0 && enq_count == 0 )
         {
             // TRUE-EMPTY: remove & stash if it’s still the same head
@@ -1586,7 +1669,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
             if ( removed && cgv_node2 )
             {
-                log("\ttry_pick_next_cgroup: REMOVED cgid %llu on from its tree!", cgc->rt_class, cgid );
+                log("\ttry_pick_next_cgroup: REMOVED cgid %llu (cvtime=%llu) from its tree!", cgc->rt_class, cgid, cgv_node2->cvtime );
                 try_stash_node( cgid, cgc, cgv_tree, cgv_node2, cpu );
             }
 
@@ -1596,36 +1679,43 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         }
 
 
-        // Tasks exist (qsz > 0), but move_to_local returned 0.
-        // This means tasks are pinned to other CPUs. We must rotate the tree
-        // to avoid Head-of-Line blocking.
+        // // --- FIX STARTS HERE ---
         
-        log("\t\ttry_pick_next_cgroup: task affinity blocked cgid %llu on cpu %d - rotating", cgc->rt_class, cgid, cpu);
+        // // Tasks exist (qsz > 0), but move_to_local returned 0.
+        // // This means tasks are pinned to other CPUs. We must rotate the tree
+        // // to avoid Head-of-Line blocking.
 
-        bpf_spin_lock(&cgv_tree_lock);
+        // char cg_name_buf[32];
+        // bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp->kn->name);
 
-        struct bpf_rb_node *removed = NULL;
-        struct cgv_node *bumped = NULL;
+        // log("\t\ttry_pick_next_cgroup: task affinity blocked cgid %llu (%s) on cpu %d - rotating", cgc->rt_class, cgid, cg_name_buf, cpu);
 
-        // Remove the node we peeked
-        remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
+        // bpf_spin_lock(&cgv_tree_lock);
 
-        if (removed && bumped) {
-            /* * Charge a slice delta (or epsilon) to rotate it to the back 
-             * so we can get to the next cgroup. 
-             */
-            bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
-            bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
-        }
+        // struct bpf_rb_node *removed = NULL;
+        // struct cgv_node *bumped = NULL;
 
-        bpf_spin_unlock(&cgv_tree_lock);
+        // // Remove the node we peeked
+        // remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
+
+        // if (removed && bumped) {
+        //     /* * Charge a slice delta (or epsilon) to rotate it to the back 
+        //      * so we can get to the next cgroup. 
+        //      */
+        //     bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+        //     bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
+        // }
+
+        // bpf_spin_unlock(&cgv_tree_lock);
         
+        // bpf_cgroup_release(cgrp);
+        // return true; // Return true so fcg_dispatch loop tries the next node
+        
+        // --- FIX ENDS HERE ---
+
+        stat_inc(FCG_STAT_PNC_AFFINITY);
         bpf_cgroup_release(cgrp);
-        return true; // Return true so fcg_dispatch loop tries the next node
-        
-        ////stat_inc(FCG_STAT_PNC_AFFINITY);
-        //bpf_cgroup_release(cgrp);
-        //return false;
+        return false;
     }
 
     /*
@@ -1655,14 +1745,24 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         * according to the actual consumption. This prevents lowpri thundering
         * herd from saturating the machine.
         */
+        u64 before = cgv_node2->cvtime; 
         cgv_node2->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+        u64 between = cgv_node2->cvtime; 
         cgrp_cap_budget(cgv_node2, cgc); 
         
         bpf_rbtree_add(cgv_tree, &cgv_node2->rb_node, cgv_node_less);
     
+        u64 cvtime = cgv_node2->cvtime;
+
         bpf_spin_unlock(&cgv_tree_lock);
 
-        log("\ttry_pick_next_cgroup: REMOVED and ADDED cgid %llu back to its tree!", cgc->rt_class, cgid );
+        // TODO: REMOVE THIS
+        if ( cvtime > 3000000000000000000ULL )
+        {
+            scx_bpf_error( "CVTIME OVERFLOW!");
+        }
+
+        log("\ttry_pick_next_cgroup: REMOVED and ADDED cgid %llu (cvtime=%llu, before=%llu, between=%llu) back to its tree!", cgc->rt_class, cgid, cvtime, before, between );
     
         *cgidp = cgid;
         stat_inc(FCG_STAT_PNC_NEXT);
@@ -1676,7 +1776,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
     bpf_spin_unlock(&cgv_tree_lock);
 
-    log("\tfcg_dispatch: try_pick_next_cgroup picked new cgroup %llu! for cpu %d, but came back to an empty head...", cgc->rt_class, cgid, cpu );
+    log("\tfcg_dispatch: try_pick_next_cgroup picked new cgroup %llu for cpu %d, but came back to an empty head...", cgc->rt_class, cgid, cpu );
 
     __u64 delta = (cgrp_slice_ns * FCG_HWEIGHT_ONE) / (cgc->hweight ?: 1);
     __sync_fetch_and_add(&cgc->cvtime_delta, delta);
@@ -1691,7 +1791,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 {
     if ( cpu < NR_CPUS_LOG )
     {
-        log("\tfcg_dispatch: called for cpu %d (tree sizes rt=%u bk=%u)", 0, cpu, cls_get_rt(), cls_get_bk());
+        //log("\tfcg_dispatch: called for cpu %d (tree sizes rt=%u bk=%u)", 0, cpu, cls_get_rt(), cls_get_bk());
     }
     else
     {
@@ -1769,21 +1869,31 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         goto pick_next_cgroup;
     }
 
-    cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
-    if (cgc) {
-        /*
-        * We want to update the vtime delta and then look for the next
-        * cgroup to execute but the latter needs to be done in a loop
-        * and we can't keep the lock held. Oh well...
-        */
-        bpf_spin_lock(&cgv_tree_lock);
-        __sync_fetch_and_add(&cgc->cvtime_delta,
-                    (cpuc->cur_at + cgrp_slice_ns - now) *
-                    FCG_HWEIGHT_ONE / (cgc->hweight ?: 1));
-        bpf_spin_unlock(&cgv_tree_lock);
-    } else {
-        stat_inc(FCG_STAT_CNS_GONE);
-    }
+    // TODO: ADD BACK
+    // cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+    // if (cgc && cpuc->cur_at > 0) {
+    //     bpf_spin_lock(&cgv_tree_lock);
+
+    //     u64 expected_end = cpuc->cur_at + cgrp_slice_ns;
+    //     u64 delta_ns = 0;
+
+    //     if (now < expected_end)   // finished early -> refund
+    //         delta_ns = expected_end - now;
+    //     else                      // finished late or exact -> no refund
+    //         delta_ns = 0;
+
+    //     u32 weight = cgc->hweight ?: 1;
+    //     u64 inc = (delta_ns * FCG_HWEIGHT_ONE) / weight;
+
+    //     __sync_fetch_and_add(&cgc->cvtime_delta, inc);
+
+    //     bpf_spin_unlock(&cgv_tree_lock);
+
+    //     //log("\tfcg_dispatch: new delta on cpu %d for cgid %llu = %llu (prev=%llu, cur_at=%llu, now=%llu)",
+    //     //    0, cpu, cgrp->kn->id, cgc->cvtime_delta, prev_delta, cpuc->cur_at, now);
+    // } else {
+    //     stat_inc(FCG_STAT_CNS_GONE);
+    // }
 
     bpf_cgroup_release( cgrp );
 
@@ -2024,6 +2134,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)fcg_cgroup_move,
         .init			= (void *)fcg_init,
         .exit			= (void *)fcg_exit,
-        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT | SCX_OPS_SWITCH_PARTIAL,
-        .timeout_ms		= 5000U,
+        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT,// | SCX_OPS_SWITCH_PARTIAL,
+        .timeout_ms		= 1000U,
         .name			= "weightedcg");
