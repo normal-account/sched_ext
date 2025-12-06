@@ -94,7 +94,7 @@ struct fcg_buddy_val {
 #endif
 
 #ifndef FCG_DEBUG
-#define FCG_DEBUG 0
+#define FCG_DEBUG 1
 #endif
 
 #ifndef FCG_BUDDIES

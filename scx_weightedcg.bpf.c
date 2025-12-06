@@ -806,23 +806,19 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct fcg_cgrp_ctx *cgc)
 
     log("\tcgrp_enqueued: confirmed stash->node has been set to NULL for cgid %llu (%s) with cvtime=%llu", cgc->rt_class, cgid, cg_name_buf, cgv_node->cvtime);
 
-    bool is_hw = is_cgroup_hw(cgrp);
-
-    if (is_hw)
+    if (cgc->rt_class)
     {
-        cgc->rt_class = 1;
         log("\tcgrp_enqueued: enqueue new cgid %llu (%s) to REAL-TIME tree!", cgc->rt_class, cgid, cg_name_buf);
     }
     else
     {
-        cgc->rt_class = 0;
         log("\tcgrp_enqueued: enqueue new cgid %llu (%s) to BACKGROUND tree!", cgc->rt_class, cgid, cg_name_buf);
     }
 
     bpf_spin_lock(&cgv_tree_lock);
     cgrp_cap_budget(cgv_node, cgc);
 
-    if (is_hw)
+    if (cgc->rt_class)
     {
         bpf_rbtree_add(&cgv_tree_rt, &cgv_node->rb_node, cgv_node_less);
     }
@@ -833,7 +829,7 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct fcg_cgrp_ctx *cgc)
 
     bpf_spin_unlock(&cgv_tree_lock);
 
-    fcg_dump_bk_tree();
+    //fcg_dump_bk_tree();
 }
 
 static void set_bypassed_at(struct task_struct *p, struct fcg_task_ctx *taskc)
@@ -1162,10 +1158,10 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         {
             log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d on cgid %llu", cgc->rt_class, tgt, p->pid, cgid);
 
-            cgrp_enqueued(cgrp, cgc);
-
             // Credit once per DSQ residency
             increment_enq_count( taskc, cgc, cgid );
+
+            cgrp_enqueued(cgrp, cgc);
 
             scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
         }
@@ -1336,7 +1332,7 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
     //    cpu, scx_bpf_now());
 
 
-    //log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
+    log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
 
     bpf_map_update_elem(&cur_cgid, &cpu, &sel_id, BPF_ANY);
 
@@ -1540,7 +1536,7 @@ inline static void try_stash_node( u64 cgid, struct fcg_cgrp_ctx *cgc, struct bp
     if ( stash )
     {
         __sync_val_compare_and_swap( &cgc->queued, 1, 0 );
-        
+
         cgv_node = bpf_kptr_xchg(&stash->node, cgv_node);
         log("\tfcg_dispatch: STASHING node for cgid %llu on cpu %d", cgc->rt_class, cgid, cpu );
 
@@ -1631,7 +1627,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
         if (removed && bumped) {
             /* epsilon bump: reorder only, do NOT “charge” budget here */
-            //bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+            bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
             bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
         }
 
@@ -2027,6 +2023,7 @@ int BPF_STRUCT_OPS_SLEEPABLE(fcg_cgroup_init, struct cgroup *cgrp,
 
     cgc->weight = args->weight;
     cgc->hweight = FCG_HWEIGHT_ONE;
+    cgc->rt_class = is_cgroup_hw(cgrp) ? 1 : 0;
 
     cpuset_ensure_entry( cgid );
 
