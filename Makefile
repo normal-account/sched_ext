@@ -61,7 +61,7 @@ $(LOADER_NAME): $(SCHED_NAME).skel.h
 
 # Start your scheduler via the loader (keeps the process alive)
 start_loader: loader
-	./clear_traces.sh
+	#./clear_traces.sh
 	sudo ./$(LOADER_NAME)
 
 clean:
