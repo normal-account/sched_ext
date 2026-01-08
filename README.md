@@ -7,6 +7,20 @@ This is my draft implementation of a weighted cgroup sched_ext scheduler. It's i
 * **scx_weightedcg.c**: The C loader used to load the BPF scheduler.
 * **scx_weightedcg.bpf.c**: The actual BPF scheduler.
 
+# Dependencies
+
+To build and use this scheduler, you'll need the following libraries:
+
+* 1. **clang** for the compilation. You can most likely get it from your package manager.
+* 2. **bpftool** to generate the `vmlinux` header and load the scheduler as a BPF module. You should download and build it from source. You may need to install the **base-devel** package first.
+```
+git clone --recurse-submodules https://github.com/libbpf/bpftool.git
+cd bpftool/src
+make
+sudo make install
+```
+
+
 # Build
 
 * 1. Verify that your kernel supports sched_ext. Run `uname -r` and confirm that your version is 6.12 or higher.

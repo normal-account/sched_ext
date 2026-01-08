@@ -95,12 +95,6 @@ struct fcg_task_ctx {
     u8      rt_class;
     s32     sel_cpu;
 
-    // Baton state variables
-    u32  buddy_tid;         // the task that tends to run right before us
-    s32  buddy_cpu;         // last known CPU where buddy ran/stopped
-    u32  buddy_score;       // strength of the observed pair
-    u64  buddy_seen_ns;     // last time this pairing was seen
-
     s32  last_cpu;          // where *we* last ran
     u64  last_run_ns;
     u64  last_stop_ns;
@@ -280,50 +274,6 @@ static __always_inline void refresh_cgrp_cpuset(__u64 cgid, const struct task_st
 }
 
 /* CPUSET TRACKING END */
-
-/* BLOCK DETECTION START */
-
-#ifdef FCG_BUDDIES
-// ---------- Buddy stats (debug-only) ----------
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536); 
-    __type(key,   struct fcg_buddy_key);
-    __type(value, struct fcg_buddy_val);
-} buddy_stats SEC(".maps");
-
-static __always_inline void fcg_buddy_stat_inc(struct task_struct *p, __s32 buddy_pid)
-{
-    if (buddy_pid <= 0)
-        return;
-
-    if ((__u32)buddy_pid == (__u32)p->pid)
-        return;
-
-    struct fcg_buddy_key k = {
-        .pid   = (__u32)p->pid,
-        .buddy = (__u32)buddy_pid,
-    };
-
-    struct fcg_buddy_val *v = bpf_map_lookup_elem(&buddy_stats, &k);
-    if (v) {
-        __sync_fetch_and_add(&v->cnt, 1);
-        v->last_ts  = scx_bpf_now();
-        v->last_cpu = (__u32)bpf_get_smp_processor_id();
-        return;
-    }
-
-    struct fcg_buddy_val init = {
-        .cnt      = 1,
-        .last_ts  = scx_bpf_now(),
-        .last_cpu = (__u32)bpf_get_smp_processor_id(),
-    };
-    bpf_map_update_elem(&buddy_stats, &k, &init, BPF_NOEXIST);
-}
-#endif // FCG_BUDDIES
-
-// BLOCK DETECTION END
 
 // DUMPING UTILITIES START
 
@@ -542,15 +492,19 @@ static void cgrp_dispatch_stat( __u64 cgid, struct fcg_cgrp_ctx* cgc, struct fcg
     log("\tcgrp_dispatch_stat: ts = %llu, bumping count", cgc->rt_class, ts);
 
     __sync_fetch_and_add( &cg_stat->lat_sum_ns, lat );
-    __sync_fetch_and_add( &cg_stat->lat_cnt, 1 );
+    __u64 lat_cnt = __sync_fetch_and_add( &cg_stat->lat_cnt, 1 );
 
     __u64 lat_max = __sync_fetch_and_add( &cg_stat->lat_max, 0 );
-    __u64 lat_ms = lat / 1000000;
 
-    if ( lat_ms > 1 )
+    // No floating point types in BPF code
+    __u64 lat_ms_int = lat / 1000000;
+    __u64 lat_ms_frac = lat % 1000000;
+
+    // if ( lat_ms > 1 )
+    if ( lat_cnt > 100 && lat > lat_max )
     {
         if ( cgc->rt_class ) 
-            log("\tcgrp_dispatch_stat: lat = %llu (rt_class = %d), NEW MAX!", cgc->rt_class, lat_ms, cgc->rt_class);
+            log("\tcgrp_dispatch_stat: lat = %llu.%llu ms (rt_class = %d), NEW MAX!", cgc->rt_class, lat_ms_int, lat_ms_frac, cgc->rt_class);
 
         __sync_val_compare_and_swap( &cg_stat->lat_max, lat_max, lat );
     }
@@ -1198,6 +1152,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         {
             tgt = taskc->sel_cpu;
 
+            log("\tfcg_enqueue: using CACHED CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
+
             enum cpu_runcls cls = cpu_cls(tgt);
 
             if ( CPU_IDLING == cls )
@@ -1208,6 +1164,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         else
         {
             tgt = pick_cpu_to_kick_for_rt(p, nr_cpus, &is_idle, &can_kick);
+
+            log("\tfcg_enqueue: using PICKED CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
 
             //if ( !is_idle && sel_cpu_allowed )
             //{
@@ -1227,6 +1185,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         cgrp_enqueue_stat( cgrp, cgc, true, p->pid );
         u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
         
+        // TODO: Use insert vtime here?
         scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
 
         bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
@@ -1671,6 +1630,12 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
     *cgidp = 0;
 
+    // enum cpu_runcls cls = cpu_cls(cpu);
+    // if ( cls == CPU_RT )
+    // {
+    //     return true;
+    // }
+
     bpf_spin_lock(&cgv_tree_lock);
 
     // 1. Peek head under lock, but don't remove
@@ -1900,9 +1865,14 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
     if (!cpuc)
         return;
 
-    //if (true || !cpuc->cur_cgid)
     if (!cpuc->cur_cgid)
         goto pick_next_cgroup;
+
+    enum cpu_runcls cls = cpu_cls(cpu);
+    if ( cls == CPU_RT )
+    {
+        return;
+    }
 
     if (time_before(now, cpuc->cur_at + cgrp_slice_ns)) {
 
@@ -1913,9 +1883,10 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         }
 
         /* If current is BK and *any* RT is pending, try RT first. */
-        log("\tfcg_dispatch: Should we stay on same CPU %d for cgroup %llu with rt=%llu", cgc->rt_class, cpu, cpuc->cur_cgid, cls_get_rt());
         if ( cgrp && cgc && cgc->rt_class == 0 /*&& cls_get_rt() > 0*/ ) 
         {
+            log("\tfcg_dispatch: Should we stay on same CPU %d for cgroup %llu with rt=%llu", 0, cpu, cpuc->cur_cgid, cls_get_rt());
+
             bpf_cgroup_release( cgrp );
             goto pick_next_cgroup;  // jump to the RT try_pick_next_cgroup path
         }
@@ -1927,7 +1898,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
             {
                 cgrp_dispatch_stat( cpuc->cur_cgid, cgc, cpuc );
 
-                log("\tfcg_dispatch: staying on same CPU %d for cgroup %llu", cgc->rt_class, cpu, cpuc->cur_cgid);
+                log("\tfcg_dispatch: staying on same CPU %d for cgroup %llu", 0, cpu, cpuc->cur_cgid);
 
                 bpf_cgroup_release(cgrp);
             }
@@ -2076,10 +2047,6 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
 
     taskc->bypassed_at      = 0;
 
-    taskc->buddy_tid        = 0;
-    taskc->buddy_cpu        = -1;
-    taskc->buddy_score      = 0;
-    taskc->buddy_seen_ns    = 0;
     taskc->last_cpu         = -1;
     taskc->last_run_ns      = 0;
     taskc->last_stop_ns     = 0;
@@ -2213,6 +2180,49 @@ void BPF_STRUCT_OPS(fcg_exit, struct scx_exit_info *ei)
     UEI_RECORD(uei, ei);
 }
 
+void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
+{
+    struct cgroup *cgrp;
+    struct fcg_cgrp_ctx *cgc;
+    s32 task_cpu;
+    s32 cgid = 0;
+    u64 *cpu_cgidp;
+    u8 rt_class = 0;
+    struct fcg_task_ctx * taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (!taskc) return;
+
+    task_cpu = taskc->sel_cpu;
+
+    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+
+    if ( cgrp )
+    {
+        cgc = find_cgrp_ctx(cgrp);
+        cgid = cgrp->kn->id;
+        if ( cgc )
+        {
+            rt_class = cgc->rt_class;
+        }
+    }
+    bpf_cgroup_release(cgrp);
+
+    log("\tfcg_task_exit: task with pid %d (cgid %llu) exiting!!!", rt_class, p->pid, cgid);
+
+    if ( 0 == cgid ) return;
+
+    cpu_cgidp = bpf_map_lookup_elem(&cur_cgid, &task_cpu);
+
+    if( !cpu_cgidp ) return;
+
+    if ( *cpu_cgidp == cgid )
+    {
+        s32 empty_cgid = 0;
+        bpf_map_update_elem(&cur_cgid, &task_cpu, &empty_cgid, BPF_ANY);
+
+        log("\tfcg_task_exit: CLEARED cur_cgid for task with pid %d!!!", rt_class, p->pid);
+    }
+}
+
 SCX_OPS_DEFINE(weightedcg_ops,
         .select_cpu		= (void *) fcg_select_cpu,
         .enqueue			= (void *)fcg_enqueue,
@@ -2222,6 +2232,7 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .stopping		= (void *)fcg_stopping,
         .quiescent		= (void *)fcg_quiescent,
         .init_task		= (void *)fcg_init_task,
+        .exit_task      = (void *)fcg_exit_task,
         .cgroup_set_weight	= (void *)fcg_cgroup_set_weight,
         .cgroup_init		= (void *)fcg_cgroup_init,
         .cgroup_exit		= (void *)fcg_cgroup_exit,
