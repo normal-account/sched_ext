@@ -81,23 +81,21 @@ struct {
     __type(value, struct cgv_node_stash);
 } cgv_node_stash SEC(".maps");
 
-/* CPU -> current cgid (0 if none). Updated in dispatch; used to spread hw in select_cpu */
+/* CPU -> current cgid (0 if none). */
 struct {
 __uint(type, BPF_MAP_TYPE_ARRAY);
 __uint(key_size, sizeof(u32));
 __uint(value_size, sizeof(u64));
-__uint(max_entries, 1024);
+__uint(max_entries, 1024); // TODO: Verify that nr_cpus doesn't exceed 1024
 } cur_cgid SEC(".maps");
 
 struct fcg_task_ctx {
     u64		bypassed_at;
     u64     enq_cgid;       // cgroup we credited enq_count to
     u8      rt_class;
-    s32     sel_cpu;
-
-    s32  last_cpu;          // where *we* last ran
-    u64  last_run_ns;
-    u64  last_stop_ns;
+    
+    u32     sel_cpu;
+    u32     cur_cpu;          // where it's running
 };
 
 struct cls_counters {
@@ -441,8 +439,11 @@ static void cgrp_enqueue_stat( struct cgroup *cgrp, struct fcg_cgrp_ctx* cgc, bo
     if (!cg_stat) {
         struct fcg_cgrp_stats zero = {};
         if (bpf_map_update_elem(&cgrp_stats, &cgid, &zero, BPF_NOEXIST))
+        {
             return;
-            cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid);
+        }
+        
+        cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid);
     
         if (!cg_stat) return;
 
@@ -935,8 +936,8 @@ static __always_inline void set_flags_from_cls(enum cpu_runcls cls, bool *is_idl
     *can_kick = (cls == CPU_BK);
 }
 
-static __attribute__((noinline)) s32
-pick_cpu_to_kick_for_rt(struct task_struct *p, s32 hint_cpu, bool *is_idle, bool *can_kick)
+static __attribute__((noinline)) u32
+pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu, bool *is_idle, bool *can_kick)
 {
     if (!is_idle || !can_kick)
         return nr_cpus;
@@ -955,8 +956,8 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, s32 hint_cpu, bool *is_idle, bool
     u32 step  = (bpf_get_prandom_u32() | 1) % n1;
     if (!step) step = 1;
 
-    s32 best_bk = nr_cpus; u32 best_bk_load = ~0u;
-    s32 best_rt = nr_cpus; u32 best_rt_load = ~0u;
+    u32 best_bk = nr_cpus; u32 best_bk_load = ~0u;
+    u32 best_rt = nr_cpus; u32 best_rt_load = ~0u;
 
     // Precompute hint properties if usable (keep same semantics)
     bool hint_ok = (hint_cpu >= 0) && ((u32)hint_cpu < n) &&
@@ -984,7 +985,7 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, s32 hint_cpu, bool *is_idle, bool
 
             if (cls == CPU_IDLING) {
                 *is_idle = true;
-                return (s32)idx;
+                return idx;
             }
 
             // Key shrink: only compute load if we might use it
@@ -993,12 +994,12 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, s32 hint_cpu, bool *is_idle, bool
 
                 if (cls == CPU_BK) {
                     if (load < best_bk_load) {
-                        best_bk = (s32)idx;
+                        best_bk = idx;
                         best_bk_load = load;
                     }
                 } else { // cls == CPU_RT
                     if (load < best_rt_load) {
-                        best_rt = (s32)idx;
+                        best_rt = idx;
                         best_rt_load = load;
                     }
                 }
@@ -1049,14 +1050,14 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     cgc = find_cgrp_ctx(cgrp);
     bpf_cgroup_release(cgrp);
 
-    // IF this is the RT class, keep your existing logic
+    // IF this is the RT class
     if ( cgc && cgc->rt_class)
     {
         taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, prev_cpu, &is_idle, &is_idle);
         return taskc->sel_cpu;
     }
 
-    // ELSE: This is a Background task (like benchbase)
+    // ELSE: This is a Background task
     
     // 1. Try to pick a fully idle CPU from the allowed mask
     // SCX_PICK_IDLE_CORE prefers physical cores that are totally idle
@@ -1139,7 +1140,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
     bool is_idle = false;
     bool can_kick = false;
-    s32 tgt = nr_cpus;
+    u32 tgt = nr_cpus;
 
     if ( cgc->rt_class )
     {
@@ -1188,6 +1189,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         // TODO: Use insert vtime here?
         scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
 
+        // The below is no good. cur_cgid should be what the CPU is actually running. Remove and verify against regressions.
+        taskc->cur_cpu = tgt;
         bpf_map_update_elem(&cur_cgid, &tgt, &cgid, BPF_ANY);
 
         if ( is_idle && scx_bpf_test_and_clear_cpu_idle(tgt) )
@@ -1367,21 +1370,18 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
 {
     struct cgroup *cgrp;
     struct fcg_cgrp_ctx *cgc;
-    struct fcg_task_ctx *taskc;
-
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
 
     /* Update per-CPU current cgid immediately for selected CPU */
-
-    u64 sel_id = cgrp->kn->id;
-    s32 cpu = (s32)bpf_get_smp_processor_id();
+    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
 
+    u32 cpu = bpf_get_smp_processor_id();
+    u64 sel_id = cgrp->kn->id;
 
-    //log("SCX_EVT run_start tid=%d cgid=%llu cpu=%d ts_ns=%llu", 
-    //    (cgc ? cgc->rt_class : 0), p->pid, sel_id,
-    //    cpu, scx_bpf_now());
-
+    struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (taskc) {
+        taskc->cur_cpu = cpu;
+    }
 
     log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, sel_id, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
 
@@ -1406,8 +1406,6 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         cgrp_running_stat( sel_id, cgc, cpuc );
 #endif
 
-        taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-
         // Decrement the enq_count if applicable and set the enq cgid to 0
         decrement_enq_count( taskc, cgc, sel_id );
 
@@ -1430,8 +1428,7 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     struct cgroup *cgrp;
     struct fcg_cgrp_ctx *cgc;
 
-    s32 cpu = (s32)bpf_get_smp_processor_id();
-    int log = should_log(p->comm, 0);
+    u32 cpu = bpf_get_smp_processor_id();
 
     int rt_class = 0;
     /*
@@ -1479,29 +1476,23 @@ log_and_out:
 
     if ( !runnable )
     {
+        log("\tstopping: sleep pid %d comm %s on cpu %d (cur_cgid cleared)", rt_class, p->pid, p->comm, cpu);
+
+        if ( taskc )
+        {
+            taskc->cur_cpu = nr_cpus;
+        }
+
         u64 zero = 0;
         bpf_map_update_elem(&cur_cgid, &cpu, &zero, BPF_ANY);
     }
-
-    if (log) 
+    else if (p->scx.slice > 0)
     {
-        if (!runnable) 
-        {    
-            log("SCX_EVT run_stop  tid=%d cgid=%llu cpu=%d ts_ns=%llu",
-                rt_class, p->pid, cgid,
-                cpu, scx_bpf_now());
-
-            log("\tstopping: sleep pid %d comm %s on cpu %d (cur_cgid[cpu=%d] cleared)", rt_class, p->pid, p->comm, cpu, cpu);
-            //dump_cur_cgid(0, rt_class);
-        }
-        else if (p->scx.slice > 0)
-        {
-            log("\tstopping: preempt pid %d comm %s on cpu %d (slice_left=%u)", rt_class, p->pid, p->comm, cpu, p->scx.slice);
-        }
-        else
-        {
-            log("\tstopping: timeslice/yield pid %d comm %s on cpu %d", rt_class, p->pid, p->comm, cpu);
-        }
+        log("\tstopping: preempt pid %d comm %s on cpu %d (slice_left=%u)", rt_class, p->pid, p->comm, cpu, p->scx.slice);
+    }
+    else
+    {
+        log("\tstopping: timeslice/yield pid %d comm %s on cpu %d", rt_class, p->pid, p->comm, cpu);
     }
 }
 
@@ -1871,6 +1862,11 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
     enum cpu_runcls cls = cpu_cls(cpu);
     if ( cls == CPU_RT )
     {
+        stat_inc(FCG_STAT_CNS_GONE); // TODO: Remove this or create a dedicated stat
+
+        u64 *cgidp = bpf_map_lookup_elem(&cur_cgid, &cpu);
+
+        log("\tfcg_dispatch: CANCELLED on CPU %d as it is running RT %llu (last BK %llu at %llu)", 1, cpu, cgidp ? *cgidp : 0, cpuc->cur_cgid, cpuc->cur_at);
         return;
     }
 
@@ -1964,6 +1960,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 pick_next_cgroup:
     cpuc->cur_at = now;
     cpuc->cur_cgid = 0;
+    // TODO: This is not needed. Remove and make sure it doesn't cause regression.
     bpf_map_update_elem(&cur_cgid, &cpu, &cpuc->cur_cgid, BPF_ANY);
 
     u32 fallback_q = scx_bpf_dsq_nr_queued(FALLBACK_DSQ);
@@ -2046,16 +2043,15 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
         return -ENOMEM;
 
     taskc->bypassed_at      = 0;
-
-    taskc->last_cpu         = -1;
-    taskc->last_run_ns      = 0;
-    taskc->last_stop_ns     = 0;
-
+    taskc->cur_cpu          = nr_cpus;
+    taskc->sel_cpu          = nr_cpus;
 
     if (!(cgc = find_cgrp_ctx(args->cgroup)))
         return -ENOENT;
 
     p->scx.dsq_vtime = cgc->tvtime_now;
+
+    log("\t\t\tfcg_init_task: init task %d", 0, p->pid);
 
     return 0;
 }
@@ -2159,15 +2155,33 @@ void BPF_STRUCT_OPS(fcg_cgroup_move, struct task_struct *p,
     if (!(from_cgc = find_cgrp_ctx(from)) || !(to_cgc = find_cgrp_ctx(to)))
         return;
 
-    log("\tfcg_cgroup_move: moving task %d from cgroup %llu to cgroup %llu!!!", 1, p->pid, from->kn->id, to->kn->id);
-
-
-    //struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     //decrement_enq_count( taskc, from_cgc, from->kn->id );
-
 
     delta = time_delta(p->scx.dsq_vtime, from_cgc->tvtime_now);
     p->scx.dsq_vtime = to_cgc->tvtime_now + delta;
+
+    ///// CHANGES AFTER THIS /////
+
+    struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if ( !taskc ) return;
+
+    u32 cur_cpu = taskc->cur_cpu;
+    if ( cur_cpu >= nr_cpus )
+        return;
+
+    log("\tfcg_cgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", 1, p->pid, cur_cpu, from->kn->id, to->kn->id);
+
+    u64 *cpu_cgidp = bpf_map_lookup_elem(&cur_cgid, &cur_cpu);
+
+    if( !cpu_cgidp || 0 == *cpu_cgidp) return;
+
+    if ( *cpu_cgidp == from->kn->id )
+    {
+        u64 to_cgid = to->kn->id;
+        log("\tfcg_cgroup_move: CHANGED cur_cgid for CPU %d from cgid %llu to %llu (pid %d)!!!", 1, cur_cpu, *cpu_cgidp, to_cgid, p->pid);
+        // TODO: This can race with fcg_stopping setting cur_cgid to 0
+        bpf_map_update_elem(&cur_cgid, &cur_cpu, &to_cgid, BPF_ANY);
+    }
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(fcg_init)
@@ -2184,14 +2198,20 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
 {
     struct cgroup *cgrp;
     struct fcg_cgrp_ctx *cgc;
-    s32 task_cpu;
-    s32 cgid = 0;
+    u64 cgid = 0;
     u64 *cpu_cgidp;
     u8 rt_class = 0;
-    struct fcg_task_ctx * taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    if (!taskc) return;
 
-    task_cpu = taskc->sel_cpu;
+    struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if ( !taskc ) return;
+
+    u32 cur_cpu = taskc->cur_cpu;
+    if ( cur_cpu >= nr_cpus )
+        return;
+
+    cpu_cgidp = bpf_map_lookup_elem(&cur_cgid, &cur_cpu);
+
+    if( !cpu_cgidp || 0 == *cpu_cgidp ) return;
 
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
 
@@ -2208,16 +2228,10 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
 
     log("\tfcg_task_exit: task with pid %d (cgid %llu) exiting!!!", rt_class, p->pid, cgid);
 
-    if ( 0 == cgid ) return;
-
-    cpu_cgidp = bpf_map_lookup_elem(&cur_cgid, &task_cpu);
-
-    if( !cpu_cgidp ) return;
-
     if ( *cpu_cgidp == cgid )
     {
-        s32 empty_cgid = 0;
-        bpf_map_update_elem(&cur_cgid, &task_cpu, &empty_cgid, BPF_ANY);
+        u64 zero = 0;
+        bpf_map_update_elem(&cur_cgid, &cur_cpu, &zero, BPF_ANY);
 
         log("\tfcg_task_exit: CLEARED cur_cgid for task with pid %d!!!", rt_class, p->pid);
     }
