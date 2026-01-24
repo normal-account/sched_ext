@@ -61,18 +61,17 @@ static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel)
 			{
 			double avg_ms = (val.lat_cnt ? (double)val.lat_sum_ns / val.lat_cnt / 1e6 : 0.0);
 			double max_ms = (val.lat_max ? (double)val.lat_max / 1e6 : 0.0);
-			double move_avg_ms = (val.move_lat_cnt ? (double)val.move_lat_sum_ns / val.move_lat_cnt : 0.0);
 
-			printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu  dir enq: %6llu  cnt:%6llu dp avg:%6.4f  dp max:%6.2f move cnt:%6llu move(ns) avg:%6.0f\n",
+			printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu  enq: %6llu  dp:%6llu dp avg:%6.4f  dp max:%6.2f move cnt:%6llu\n",
 				val.name,
 				val.rt_class,
 				val.weight,
-				(unsigned long long)val.dir_enq_cnt,
+				(unsigned long long)val.enq_cnt,
 				(unsigned long long)val.lat_cnt,
 				avg_ms,
 				max_ms,
-				val.move_lat_cnt,
-				move_avg_ms);
+				val.move_lat_cnt
+			);
 			}
 		}
 		key = next;
