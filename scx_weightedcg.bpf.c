@@ -102,7 +102,10 @@ struct fcg_task_ctx {
     u32     last_cpu;       // where it last ran
 
 #if FCG_DEBUG
+    u64 run_start_exec_ns;
+
     u64 first_enq_ts;     // armed timestamp for enqueue->dispatch latency
+    u8  rt_enq_bucket;
 #endif
 };
 
@@ -220,13 +223,13 @@ static __always_inline void decrement_enq_count( struct fcg_task_ctx *taskc, str
 
 /* PER-CPU ACCOUNTING START */
 
-static __always_inline void cnt_inc(struct fcg_cpu_ctx *cpuc, u32 cpu, bool is_rt)
+static __always_inline void cnt_inc(struct fcg_cpu_ctx *cpuc, u32 cpu, s32 pid, bool is_rt)
 {
     if (!cpuc) return;
     if (is_rt) __sync_fetch_and_add(&cpuc->rt_cnt, 1);
     else       __sync_fetch_and_add(&cpuc->bk_cnt, 1);
 
-    log("\tcnt_dec: incrementing on cpu %u", is_rt, cpu);
+    log("\tcnt_inc: incrementing on cpu %u for pid %d (is_rt=%u)", is_rt, cpu, pid, (u32)is_rt );
 }
 
 static __always_inline void cnt_inc_pending(struct fcg_cpu_ctx *cpuc, u32 cpu)
@@ -251,7 +254,7 @@ static __always_inline void cnt_dec_pending(struct fcg_cpu_ctx *cpuc, u32 cpu, s
     u64 old = __sync_fetch_and_sub(&cpuc->bk_cnt_pending, 1);
 
     if (old == 0) {
-        log("\tcnt_dec: ERROR, cnt PENDING underflow on cpu %u", 0, cpu);
+        log("\tcnt_dec_pending: ERROR, cnt PENDING underflow on cpu %u", 0, cpu);
         __sync_fetch_and_add(&cpuc->bk_cnt_pending, 1);
 
         //scx_bpf_error("cnt underflow for cpu %u (rt=%u)", cpu, (u32)is_rt);
@@ -260,8 +263,6 @@ static __always_inline void cnt_dec_pending(struct fcg_cpu_ctx *cpuc, u32 cpu, s
 
 static __always_inline void cnt_dec(struct fcg_cpu_ctx *cpuc, bool is_rt, u32 cpu, s32 pid, u64 cgid)
 {
-    log("\tcnt_dec: decrementing on cpu %u for task %d (cgid %u)", is_rt, cpu, pid, cgid);
-
     if (!cpuc) {
         scx_bpf_error("cnt_dec: cpuc NULL for cpu %u (rt=%u)", cpu, (u32)is_rt);
         return;
@@ -269,11 +270,15 @@ static __always_inline void cnt_dec(struct fcg_cpu_ctx *cpuc, bool is_rt, u32 cp
 
     u64 *cnt_ptr = is_rt ? &cpuc->rt_cnt : &cpuc->bk_cnt;
 
+    log("\tcnt_dec: decrementing on cpu %u for task %d (cgid %u, is_rt=%u, cur_cnt=%llu)", is_rt, cpu, pid, cgid, (u32)is_rt, *cnt_ptr);
+
     // atomic decrement; returns previous value
     u64 old = __sync_fetch_and_sub(cnt_ptr, 1);
 
     if (old == 0) {
-        scx_bpf_error("cnt underflow for cpu %u (rt=%u)", cpu, (u32)is_rt);
+        log("\tcnt_dec: ERROR, cnt underflow on cpu %u for pid %d", is_rt, cpu, pid);
+
+        scx_bpf_error("cnt underflow for cpu %u for pid %d (rt=%u)", cpu, pid, (u32)is_rt);
     }
 }
 
@@ -631,7 +636,7 @@ static void cgrp_running_stat( __u64 cgid, struct fcg_cgrp_ctx* cgc, struct fcg_
 }
 
 static __always_inline void
-task_enqueue_stat(struct task_struct *p, struct fcg_task_ctx *taskc, u64 cgid)
+task_enqueue_stat(struct task_struct *p, struct fcg_task_ctx *taskc, u64 cgid, bool is_idle, bool can_kick)
 {
 #if FCG_DEBUG
     if (!p || !taskc)
@@ -647,6 +652,19 @@ task_enqueue_stat(struct task_struct *p, struct fcg_task_ctx *taskc, u64 cgid)
     if (__sync_fetch_and_add(&taskc->first_enq_ts, 0) == 0) {
         u64 ts = bpf_ktime_get_ns();
         __sync_val_compare_and_swap(&taskc->first_enq_ts, 0, ts);
+
+        if (is_idle)
+        {
+            taskc->rt_enq_bucket = CPU_IDLING;
+        }
+        else if (can_kick)
+        {
+            taskc->rt_enq_bucket = CPU_BK;
+        }
+        else 
+        {
+            taskc->rt_enq_bucket = CPU_RT;
+        }
 
         log("\ttask_enqueue_stat: setting first_enq_ts = %llu for pid %d", 1, ts, p->pid);
     }
@@ -681,18 +699,40 @@ task_running_stat(struct task_struct *p, struct fcg_task_ctx *taskc,
     if (!cg_stat)
         return;
 
-    __sync_fetch_and_add(&cg_stat->lat_sum_ns, lat);
-    u64 lat_cnt = __sync_fetch_and_add(&cg_stat->lat_cnt, 1);
+    u64 *enq_cnt;
+    u64 *enq_sum_ns;
+    u64 *enq_max;
+    
+    if ( CPU_IDLING == taskc->rt_enq_bucket )
+    {
+        enq_cnt = &cg_stat->enq_idle_cnt;
+        enq_max = &cg_stat->enq_idle_max;
+        enq_sum_ns = &cg_stat->enq_idle_sum_ns;
+    }
+    else if ( CPU_BK == taskc->rt_enq_bucket)
+    {
+        enq_cnt = &cg_stat->enq_bk_cnt;
+        enq_max = &cg_stat->enq_bk_max;
+        enq_sum_ns = &cg_stat->enq_bk_sum_ns;
+    }
+    else
+    {
+        enq_cnt = &cg_stat->enq_rt_cnt;
+        enq_max = &cg_stat->enq_rt_max;
+        enq_sum_ns = &cg_stat->enq_rt_sum_ns;
+    }
 
-    u64 lat_max = __sync_fetch_and_add(&cg_stat->lat_max, 0);
+    __sync_fetch_and_add(enq_sum_ns, lat);
+    u64 lat_cnt = __sync_fetch_and_add(enq_cnt, 1);
+    u64 lat_max = __sync_fetch_and_add(enq_max, 0);
 
-    if (lat_cnt > 100 && (lat > lat_max || (lat / 10000) >= 10)) {
+    if (lat_cnt > 100 && (lat > lat_max /*|| (lat / 10000) >= 10*/ )) {
         u64 lat_ms_int  = lat / 1000000;
         u64 lat_ms_frac = lat % 1000000;
 
         log("\t\ttask_running_stat: NEW MAX with lat = %llu.%llu ms for pid %d (ts=%llu),", cgc->rt_class, lat_ms_int, lat_ms_frac, p->pid, ts);
 
-        __sync_val_compare_and_swap(&cg_stat->lat_max, lat_max, lat);
+        __sync_val_compare_and_swap(enq_max, lat_max, lat);
     }
 #endif
 }
@@ -1351,7 +1391,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
-
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
     if (!cgc)
@@ -1377,8 +1416,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
     if ( cgc->rt_class )
     {
-        task_enqueue_stat( p, taskc, cgid );
-
         const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
 
         bool sel_cpu_allowed =  bpf_cpumask_test_cpu(taskc->sel_cpu, allowed);
@@ -1415,6 +1452,9 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
             stat_inc(FCG_STAT_PNC_AFFINITY);
         }
+
+        task_enqueue_stat( p, taskc, cgid, is_idle, can_kick );
+
         taskc->sel_cpu = nr_cpus;
     }
 
@@ -1424,6 +1464,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         set_bypassed_at(p, taskc);
 
         u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
+
+        if ( can_kick ) rt_flags = rt_flags | SCX_ENQ_PREEMPT;
         
         // TODO: Use insert vtime here?
         scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns/*SCX_SLICE_INF*/, rt_flags );
@@ -1433,7 +1475,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
         if (tgtc)
         {
-            cnt_inc(tgtc, tgt, true);
+            cnt_inc(tgtc, tgt, p->pid, true);
         } 
 
         rt_clear_claim( tgt, p->pid );
@@ -1463,7 +1505,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     }
     else
     {
-        log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d on cgid %llu", cgc->rt_class, tgt, p->pid, cgid);
+        log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d on cgid %llu with slice %llu", cgc->rt_class, tgt, p->pid, cgid, task_slice_ns);
 
         // Credit once per DSQ residency
         increment_enq_count( taskc, cgc, cgid );
@@ -1609,12 +1651,10 @@ void BPF_STRUCT_OPS(fcg_runnable, struct task_struct *p, u64 enq_flags)
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
 
-
-    #if FCG_DEBUG
-    int rt_class = cgc ? cgc->rt_class : 0;
+#if FCG_DEBUG
+    u8 rt_class = cgc ? cgc->rt_class : 0;
     log("\trunnable: pid %d comm %s", rt_class, p->pid, p->comm);
-    #endif
-
+#endif
     refresh_cgrp_cpuset( cgrp->kn->id, p );
     update_active_weight_sums(cgrp, true);
     bpf_cgroup_release(cgrp);
@@ -1643,18 +1683,15 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
             taskc->cur_cpu = cpu;
 
             cnt_dec_pending(cpuc, cpu, p->pid, cgid);
-            cnt_inc(cpuc, cpu, cgc ? cgc->rt_class : 0);
+            cnt_inc(cpuc, cpu, p->pid, cgc ? cgc->rt_class : 0);
         }
+
+        #if FCG_DEBUG
+            taskc->run_start_exec_ns = p->se.sum_exec_runtime;
+        #endif
     }
 
-    log("\trunning: pid %d comm %s (cur_cgid[cpu=%d] <= %llu, q=%d)", (cgc ? cgc->rt_class : 0), p->pid, p->comm, cpu, cgid, scx_bpf_dsq_nr_queued(FALLBACK_DSQ));
-
-    // cpuc = find_cpu_ctx(cpu);
-    // if (cpuc && scx_bpf_dsq_nr_queued( SCX_DSQ_LOCAL_ON | cpu ) == 0)
-    // {
-    //     //cpuc->cur_cgid = cgid;
-    //     __sync_lock_test_and_set(&cpuc->cur_cgid, cgid);
-    // }
+    log("\trunning cpu=%d: pid %d comm %s (cur_cgid <= %llu, slice=%llu)", (cgc ? cgc->rt_class : 0), cpu, p->pid, p->comm, cgid, p->scx.slice);
 
     if (cgc) 
     {
@@ -1693,7 +1730,6 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     struct fcg_task_ctx *taskc;
     struct cgroup *cgrp;
     struct fcg_cgrp_ctx *cgc;
-    struct fcg_cpu_ctx *cpuc;
 
     u32 cpu = bpf_get_smp_processor_id();
 
@@ -1730,10 +1766,10 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     }
 
     // TODO - REMOVE
-    if (taskc->bypassed_at) {
-        u64 used = p->se.sum_exec_runtime - taskc->bypassed_at;
-        log("\tstopping: bypass charge %llu ns to cgid", rt_class, used);
-    }
+    //if (taskc->bypassed_at) {
+    //    u64 used = p->se.sum_exec_runtime - taskc->bypassed_at;
+    //    log("\tstopping: bypass charge %llu ns to cgid", rt_class, used);
+    //}
 
     if (cgc) {
         __sync_fetch_and_add(&cgc->cvtime_delta,
@@ -1744,8 +1780,6 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
 log_and_out:
 /* Clear per-CPU current cgid only on sleep so select_cpu can consider this CPU again */
 
-    cpuc = find_cpu_ctx(cpu);
-
     if ( taskc && taskc->cur_cpu != nr_cpus )
     {
         if ( taskc->cur_cpu != cpu )
@@ -1753,14 +1787,24 @@ log_and_out:
             log("\tstopping: ERROR, task->cur_cpu (%d) != cpu (%d) for pid %d!!!", rt_class, taskc->cur_cpu, cpu, p->pid);
         }
 
+        struct fcg_cpu_ctx *cpuc = find_cpu_ctx(taskc->cur_cpu);
+
         cnt_dec( cpuc, rt_class, taskc->cur_cpu, p->pid, cgid);
 
         taskc->cur_cpu = nr_cpus;
     }
     
+#if FCG_DEBUG
+    u64 delta = taskc ? ( p->se.sum_exec_runtime - taskc->run_start_exec_ns ) : 0;
+
+    if ( delta > 500000 && !rt_class )
+    {
+        log("\tstopping: WARNING, pid %d on cpu %d comm %s ran %llu ns", rt_class, p->pid, cpu, p->comm, delta);
+    }
+
     if ( !runnable )
     {
-        log("\tstopping: sleep pid %d comm %s on cpu %d (cur_cgid cleared)", rt_class, p->pid, p->comm, cpu);
+        log("\tstopping: cpu %d sleep pid %d comm %s (cur_cgid cleared, ran %llu ns)", rt_class, cpu, p->pid, p->comm, delta);
 
         // Only clear if it's not runnable anymore, as preemption or 
         // timeslice yield guarantees that another task is on the queue.
@@ -1775,12 +1819,13 @@ log_and_out:
     }
     else if (p->scx.slice > 0)
     {
-        log("\tstopping: preempt pid %d comm %s on cpu %d (slice_left=%u)", rt_class, p->pid, p->comm, cpu, p->scx.slice);
+        log("\tstopping: preempt pid %d comm %s on cpu %d (slice_left=%u, ran %llu ns)", rt_class, p->pid, p->comm, cpu, p->scx.slice, delta);
     }
     else
     {
-        log("\tstopping: timeslice/yield pid %d comm %s on cpu %d", rt_class, p->pid, p->comm, cpu);
+        log("\tstopping: timeslice/yield pid %d comm %s on cpu %d (ran %llu ns)", rt_class, p->pid, p->comm, cpu, delta);
     }
+#endif 
 }
 
 void BPF_STRUCT_OPS(fcg_quiescent, struct task_struct *p, u64 deq_flags)
@@ -1906,12 +1951,6 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     struct cgroup *cgrp;
     u64 cgid;
 
-    enum cpu_runcls cls = cpu_cls(cpu);
-    if ( cls == CPU_RT )
-    {
-        return true;
-    }
-
     bpf_spin_lock(&cgv_tree_lock);
 
     // 1. Peek head under lock, but don't remove
@@ -1971,6 +2010,13 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
         bpf_spin_unlock(&cgv_tree_lock);
 
+        bpf_cgroup_release(cgrp);
+        return true;
+    }
+
+    enum cpu_runcls cls = cpu_cls(cpu);
+    if ( cls == CPU_RT )
+    {
         bpf_cgroup_release(cgrp);
         return true;
     }
@@ -2153,7 +2199,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         return;
     }
 
-    if (time_before(now, cpuc->cur_bk_at + cgrp_slice_ns)) {
+    if (false && time_before(now, cpuc->cur_bk_at + cgrp_slice_ns)) {
 
         // Update the non-empty count for RT/BK trees
         cgrp = bpf_cgroup_from_id(cpuc->cur_bk_cgid);
@@ -2186,7 +2232,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
                 log("\tfcg_dispatch: staying on same CPU %d for task with no cgroup", 0, cpu);
             }
 
-            cnt_inc(cpuc, cpu, false);
+            cnt_inc_pending(cpuc, cpu);
 
             return;
         }
@@ -2554,6 +2600,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)fcg_cgroup_move,
         .init			= (void *)fcg_init,
         .exit			= (void *)fcg_exit,
-        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT, //| SCX_OPS_SWITCH_PARTIAL,
+        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST, //| SCX_OPS_SWITCH_PARTIAL,
         .timeout_ms		= 10000U,
         .name			= "weightedcg");

@@ -47,6 +47,12 @@ static void sigint_handler(int dummy)
 	exit_req = 1;
 }
 
+static inline double ns_to_s(uint64_t ns) { return (double)ns / 1e9; }
+
+static inline double avg_ms(uint64_t sum, uint64_t cnt) { return cnt ? ( (double)sum / cnt / 1e6 ) : 0; }
+
+static inline double ns_to_ms(uint64_t ns) { return ns ? ( (double)ns / 1e6 ) : 0; }
+
 static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel) 
 {
 	int fd = bpf_map__fd(skel->maps.cgrp_stats);
@@ -59,43 +65,42 @@ static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel)
 		{
 			if ( strcmp(val.name, "session") != 0 )
 			{
-			double avg_ms = (val.lat_cnt ? (double)val.lat_sum_ns / val.lat_cnt / 1e6 : 0.0);
-			double max_ms = (val.lat_max ? (double)val.lat_max / 1e6 : 0.0);
-
-			printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu  enq: %6llu  dp:%6llu dp avg:%6.4f  dp max:%6.2f move cnt:%6llu\n",
-				val.name,
-				val.rt_class,
-				val.weight,
-				(unsigned long long)val.enq_cnt,
-				(unsigned long long)val.lat_cnt,
-				avg_ms,
-				max_ms,
-				val.move_lat_cnt
-			);
+				if ( val.rt_class )
+				{
+					printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu idle cnt:%4luk idle avg:%6.4f idle max:%6.2f bk cnt:%4luk bk avg:%6.2f bk max:%6.2f rt cnt:%4luk rt avg:%6.2f rt max:%6.2f\n",
+						val.name,
+						val.rt_class,
+						val.weight,
+						val.enq_idle_cnt / 1000,
+						avg_ms(val.enq_idle_sum_ns, val.enq_idle_cnt),
+						ns_to_ms(val.enq_idle_max),
+						val.enq_bk_cnt / 1000,
+						avg_ms(val.enq_bk_sum_ns, val.enq_bk_cnt),
+						ns_to_ms(val.enq_bk_max),
+						val.enq_rt_cnt / 1000,
+						avg_ms(val.enq_rt_sum_ns, val.enq_rt_cnt),
+						ns_to_ms(val.enq_rt_max)
+					);
+				}
+				else 
+				{
+					printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu  enq: %6llu  dp:%6llu dp avg:%6.4f  dp max:%6.2f move cnt:%6llu\n",
+						val.name,
+						val.rt_class,
+						val.weight,
+						(unsigned long long)val.enq_cnt,
+						(unsigned long long)val.lat_cnt,
+						avg_ms(val.lat_sum_ns, val.lat_cnt),
+						ns_to_ms(val.lat_max),
+						val.move_lat_cnt
+					);
+				}
 			}
 		}
 		key = next;
 	}
 }
 
-struct buddy_row {
-    uint32_t pid;
-    uint32_t buddy;
-    uint64_t cnt;
-    uint64_t last_ts;
-    uint32_t last_cpu;
-};
-
-
-static int cmp_buddy_row(const void *a, const void *b) {
-    const struct buddy_row *x = (const struct buddy_row *)a;
-    const struct buddy_row *y = (const struct buddy_row *)b;
-    if (x->pid   != y->pid)   return (x->pid   < y->pid)   ? -1 : 1;
-    if (x->buddy != y->buddy) return (x->buddy < y->buddy) ? -1 : 1;
-    return 0;
-}
-
-static inline double ns_to_s(uint64_t ns) { return (double)ns / 1e9; }
 
 static float read_cpu_util(__u64 *last_sum, __u64 *last_idle)
 {
@@ -189,8 +194,8 @@ restart:
 	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
 	assert(skel->rodata->nr_cpus > 0);
 
-	skel->rodata->cgrp_slice_ns = 200000;
-	skel->rodata->task_slice_ns = 200000;
+	skel->rodata->cgrp_slice_ns = 20000;
+	skel->rodata->task_slice_ns = 20000;
 
 	//skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
 	//skel->rodata->task_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");

@@ -66,8 +66,19 @@ struct fcg_cgrp_stats {
 
 	__u64 lat_sum_ns;     	// accumulated activation latency
     __u64 lat_cnt;        	// number of dispatches
-
 	__u64 lat_max;			// max latency encountered
+
+	__u64 enq_idle_sum_ns;
+    __u64 enq_idle_cnt;
+	__u64 enq_idle_max;
+
+	__u64 enq_bk_sum_ns;
+    __u64 enq_bk_cnt;
+	__u64 enq_bk_max;
+
+	__u64 enq_rt_sum_ns;
+    __u64 enq_rt_cnt;
+	__u64 enq_rt_max;
 
 	__u64 enq_cnt;
 
@@ -83,7 +94,7 @@ struct fcg_cgrp_stats {
 #endif
 
 #ifndef FCG_DEBUG
-#define FCG_DEBUG 1
+#define FCG_DEBUG 0
 #endif
 
 #ifndef FCG_BUDDIES
