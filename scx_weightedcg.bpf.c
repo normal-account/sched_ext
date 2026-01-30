@@ -2601,5 +2601,5 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .init			= (void *)fcg_init,
         .exit			= (void *)fcg_exit,
         .flags			= SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST, //| SCX_OPS_SWITCH_PARTIAL,
-        .timeout_ms		= 10000U,
+        .timeout_ms		= 0,//10000U,
         .name			= "weightedcg");
