@@ -1076,11 +1076,20 @@ static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid)
 
 static __always_inline void rt_clear_claim(u32 cpu, u32 pid)
 {
-    struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    struct fcg_cpu_ctx *cpuc = find_cpu_ctx(cpu);
+    //struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
     if (cpuc) 
     {
+        u32 prev_pid = __sync_val_compare_and_swap(&cpuc->rt_claim_pid, pid, 0);
         // Clear only if this task owns the claim
-        __sync_val_compare_and_swap(&cpuc->rt_claim_pid, pid, 0);
+        if ( prev_pid != pid )
+        {
+            log("rt_clear_claim: Cannot clear claim for pid %u on cpu %u (prev pid=%u)!", 1, pid, cpu, prev_pid);
+        }
+        else
+        {
+            log("rt_clear_claim: clearing claim for pid %u on cpu %u (New value: %u)!", 1, pid, cpu, cpuc->rt_claim_pid);
+        }
     }
 }
 
@@ -1439,7 +1448,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         }
         else
         {
-            rt_clear_claim( taskc->sel_cpu, p->pid );
+            if ( taskc->sel_cpu != nr_cpus ) rt_clear_claim( taskc->sel_cpu, p->pid );
 
             tgt = pick_cpu_to_kick_for_rt(p, nr_cpus/*taskc->last_cpu*/, &is_idle, &can_kick);
 
@@ -1672,6 +1681,13 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
 
     u32 cpu = bpf_get_smp_processor_id();
     cpuc = find_cpu_ctx(cpu);
+
+    if (cpuc && cpuc->rt_claim_pid == p->pid)
+    {
+        // Sometimes a process goes straight from select_cpu to running, skipping enqueue.
+        // In that case, we need to clear the claim here.
+        rt_clear_claim(cpu, p->pid);
+    }
 
     u64 cgid = cgrp->kn->id;
     struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
@@ -2550,11 +2566,18 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
     u8 rt_class = 0;
 
     struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-    if ( !taskc ) return;
+    if ( !taskc ) 
+    {
+        scx_bpf_error("fcg_exit_task: !taskc for pid %d", p->pid);
+        return;
+    }
 
     u32 cur_cpu = taskc->cur_cpu;
     if ( cur_cpu >= nr_cpus )
+    {
+        log("\tfcg_task_exit: skipping task with pid %d as its cpu = %d", 1, p->pid, cur_cpu);
         return;
+    }
 
     struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
     if (!cpuc) return;
@@ -2570,11 +2593,11 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
     }
     bpf_cgroup_release(cgrp);
 
-    log("\tfcg_task_exit: task with pid %d (cgid %llu) exiting!!!", rt_class, p->pid, cgid);
-
+    log("\tfcg_task_exit: task with pid %d (cgid %llu) exiting!!!", 1, p->pid, cgid);
 
     // TODO: Is this sufficient???
     cnt_dec( cpuc, rt_class, cur_cpu, p->pid, 0 );
+    rt_clear_claim( cur_cpu, p->pid );
 
     // if ( cpu_cgid == cgid )
     // {
