@@ -284,12 +284,17 @@ static __always_inline void cnt_dec(struct fcg_cpu_ctx *cpuc, bool is_rt, u32 cp
 
 enum cpu_runcls { CPU_IDLING = 0, CPU_BK, CPU_RT };
 
-static __always_inline enum cpu_runcls cpu_cls(u32 cpu)
+static __always_inline enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
 {  
     struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
     if (!cpuc) return CPU_BK; // conservative
 
-    if (__sync_fetch_and_add(&cpuc->rt_cnt, 0))
+    if (__sync_fetch_and_add(&cpuc->rt_cnt, 0) )
+        return CPU_RT;
+
+    u32 claim_pid = __sync_fetch_and_add(&cpuc->rt_claim_pid, 0);
+
+    if ( claim_pid != 0 && claim_pid != pid )
         return CPU_RT;
 
     if (__sync_fetch_and_add(&cpuc->bk_cnt, 0) || __sync_fetch_and_add(&cpuc->bk_cnt_pending, 0))
@@ -726,7 +731,7 @@ task_running_stat(struct task_struct *p, struct fcg_task_ctx *taskc,
     u64 lat_cnt = __sync_fetch_and_add(enq_cnt, 1);
     u64 lat_max = __sync_fetch_and_add(enq_max, 0);
 
-    if (lat_cnt > 100 && (lat > lat_max /*|| (lat / 10000) >= 10*/ )) {
+    if (lat_cnt > 100 && (lat > lat_max || (lat / 10000) >= 10 )) {
         u64 lat_ms_int  = lat / 1000000;
         u64 lat_ms_frac = lat % 1000000;
 
@@ -1052,14 +1057,16 @@ static void set_bypassed_at(struct task_struct *p, struct fcg_task_ctx *taskc)
     taskc->bypassed_at = p->se.sum_exec_runtime ?: (u64)-1;
 }
 
-static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid)
+static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid, bool is_idle)
 {
     //struct fcg_cpu_ctx *cpuc = find_cpu_ctx(cpu);
     struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
     if (!cpuc) return false;
 
-    // Winner takes CPU. Loser must pick another CPU.
+    if (is_idle && __sync_fetch_and_add(&cpuc->bk_cnt_pending, 0))
+        return false;
 
+    // Winner takes CPU. Loser must pick another CPU.
     bool val = __sync_val_compare_and_swap(&cpuc->rt_claim_pid, 0, pid) == 0;
 
     if ( !val )
@@ -1073,6 +1080,7 @@ static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid)
 
     return val;
 }
+
 
 static __always_inline void rt_clear_claim(u32 cpu, u32 pid)
 {
@@ -1176,7 +1184,7 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
     u32 hint_load = 0;
 
     if (hint_ok) {
-        hint_cls = cpu_cls(hint_cpu);
+        hint_cls = cpu_cls(hint_cpu, p->pid);
         if (hint_cls != CPU_IDLING)
             hint_load = cpu_load_for_pick(hint_cpu);
     }
@@ -1187,40 +1195,44 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
     u32 step  = (n == 1) ? 0 : pick_coprime_stride(n);
     u32 blacklisted = nr_cpus;
 
+    u32 best_bk, best_rt, best_bk_load, best_rt_load;
+
 #pragma clang loop unroll(disable)
     for (u32 attempt = 0; attempt < 2; attempt++) {
         /* If hint is idle, try to claim it (don’t return unclaimed). */
         if (hint_ok && hint_cls == CPU_IDLING) {
-            if (rt_try_claim_cpu(hint_cpu, pid)) {
+            if (rt_try_claim_cpu(hint_cpu, pid, true)) {
                 *is_idle = true;
                 return hint_cpu;
             }
             /* someone else claimed it – fall through and scan */
         }
 
-        u32 best_bk = nr_cpus, best_bk_load = ~0u;
-        u32 best_rt = nr_cpus, best_rt_load = ~0u;
-
+        best_bk = nr_cpus, best_bk_load = ~0u;
+        best_rt = nr_cpus, best_rt_load = ~0u;
+        
         u32 idx = start;
 
-
-#pragma clang loop unroll(disable)
-        for (u32 k = 0; k < FCG_CPU_MASK_BITS; k++) {
-            if (k >= n)
-                break; // visited all CPUs exactly once
-
+        u32 k = 0;
+        bpf_for(k, 0, n) {
             if (bpf_cpumask_test_cpu((s32)idx, allowed)) {
-                enum cpu_runcls cls = cpu_cls(idx);
+                enum cpu_runcls cls = cpu_cls(idx, p->pid);
 
                 if (cls == CPU_IDLING) {
                     log("cpu IDLE=%u (cls=%u)", 1, idx);
 
-                    /* Try to claim immediately; if fails, keep scanning. */
-                    if (rt_try_claim_cpu(idx, pid)) {
+                    // Try to claim immediately; if fails, keep scanning.
+                    if (rt_try_claim_cpu(idx, pid, true)) {
                         *is_idle = true;
                         return idx;
                     }
-                    if ( best_rt == nr_cpus ) best_rt = idx;
+
+                    // Prevent edge case where all CPUs are idle but claimed. This ensures a valid CPU is returned.
+                    if ( best_rt == nr_cpus ) 
+                    {
+                        log("fallback to best_rt=%u (cls=%u)", 1, idx, (u32)cls);
+                        best_rt = idx;
+                    }
                 } else {
 
                     log("cpu NOT IDLE=%u (cls=%u)", 1, idx, (u32)cls);
@@ -1254,46 +1266,43 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
         // Prefer BK, but claim deterministically before returning.
         if (best_bk != nr_cpus) {
             if (hint_ok && hint_cls == CPU_BK && hint_load == best_bk_load) {
-                if (rt_try_claim_cpu(hint_cpu, pid)) {
+                if (rt_try_claim_cpu(hint_cpu, pid, false)) {
                     set_flags_from_cls(hint_cls, is_idle, can_kick);
                     return hint_cpu;
                 }
-                if (hint_cpu != best_bk && rt_try_claim_cpu(best_bk, pid)) {
+                if (hint_cpu != best_bk && rt_try_claim_cpu(best_bk, pid, false)) {
                     set_flags_from_cls(CPU_BK, is_idle, can_kick);
                     return best_bk;
                 }
             } else {
-                if (rt_try_claim_cpu(best_bk, pid)) {
+                if (rt_try_claim_cpu(best_bk, pid, false)) {
                     set_flags_from_cls(CPU_BK, is_idle, can_kick);
                     return best_bk;
                 }
             }
 
             // claim failed -> retry a fresh permutation
-            if ( attempt == 0 )
-            {
-                blacklisted = best_bk;
-                continue;
-            }
-
-            if ( best_rt == nr_cpus ) best_rt = best_bk;
-            // else fallback to use best_rt
+            blacklisted = best_bk;
         }
-
-        // TODO: Get this out of the loop?
-        // Fall back to RT, with claim + hint tie-break.
-        if (best_rt != nr_cpus) {
-            if (hint_ok && hint_cls == CPU_RT && hint_load == best_rt_load) 
-            {
-                set_flags_from_cls(hint_cls, is_idle, can_kick);
-                return hint_cpu;
-            } else {
-                set_flags_from_cls(CPU_RT, is_idle, can_kick);
-                return best_rt;
-            }
-        }
-
         // nothing usable this attempt
+    }
+
+    // If there are no RT CPUs, but all the BK ones were claimed
+    if ( best_rt == nr_cpus ) 
+    {
+        best_rt = best_bk;
+    }
+
+    // Fall back to RT, with claim + hint tie-break.
+    if (best_rt != nr_cpus) {
+        if (hint_ok && hint_cls == CPU_RT && hint_load == best_rt_load) 
+        {
+            set_flags_from_cls(hint_cls, is_idle, can_kick);
+            return hint_cpu;
+        } else {
+            set_flags_from_cls(CPU_RT, is_idle, can_kick);
+            return best_rt;
+        }
     }
 
     log("pick_cpu_to_kick_for_rt: FOUND NOTHING for pid %d", 1, p->pid);
@@ -1327,7 +1336,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
 
         taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, prev_cpu, &is_idle, &is_idle);
-        taskc->sel_cls = cpu_cls( taskc->sel_cpu );
+        taskc->sel_cls = cpu_cls(taskc->sel_cpu, p->pid);
 
         log("\tfcg_select_cpu: setting SEL CPU %d for pid %d (cls=%u)", 1, taskc->sel_cpu, p->pid, (u32)taskc->sel_cls);
 
@@ -1429,7 +1438,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         bool sel_cpu_allowed =  bpf_cpumask_test_cpu(taskc->sel_cpu, allowed);
 
-        enum cpu_runcls cls = cpu_cls(taskc->sel_cpu);
+        enum cpu_runcls cls = cpu_cls(taskc->sel_cpu, 0);
 
         //if ( ( enq_flags & SCX_ENQ_REENQ ) == 0 && sel_cpu_allowed )
         //if ( sel_cpu_allowed )
@@ -1450,7 +1459,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         {
             if ( taskc->sel_cpu != nr_cpus ) rt_clear_claim( taskc->sel_cpu, p->pid );
 
-            tgt = pick_cpu_to_kick_for_rt(p, nr_cpus/*taskc->last_cpu*/, &is_idle, &can_kick);
+            tgt = pick_cpu_to_kick_for_rt(p, /*nr_cpus*/taskc->last_cpu, &is_idle, &can_kick);
 
             log("\tfcg_enqueue: using PICKED CPU %d for pid %d (is idle=%d, can_kick=%d)", cgc->rt_class, tgt, p->pid, is_idle, can_kick);
 
@@ -1472,9 +1481,9 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     {
         set_bypassed_at(p, taskc);
 
-        u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
+        u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
 
-        if ( can_kick ) rt_flags = rt_flags | SCX_ENQ_PREEMPT;
+        if ( is_idle || can_kick ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
         // TODO: Use insert vtime here?
         scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns/*SCX_SLICE_INF*/, rt_flags );
@@ -1487,23 +1496,16 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             cnt_inc(tgtc, tgt, p->pid, true);
         } 
 
-        rt_clear_claim( tgt, p->pid );
+        //rt_clear_claim( tgt, p->pid );
 
         //if ( is_idle && scx_bpf_test_and_clear_cpu_idle(tgt) )
+
         if ( is_idle )
         {
             log("\tfcg_enqueue: direct kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
             scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
             //scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
         }
-        // else if ( is_idle )
-        // {
-        //     log("\tfcg_enqueue: IDLE RACE for pid %d (idle=%d, can kick=%d)", cgc->rt_class, p->pid, (u32)is_idle, (u32)can_kick);
-
-        //     //tgt = pick_cpu_to_kick_for_rt(p, nr_cpus/*taskc->last_cpu*/, &is_idle, &can_kick);
-        //     //if ( is_idle ) scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-        //     //if ( can_kick ) scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
-        // }
         else if ( can_kick )//|| is_idle )
         {
             log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
@@ -2030,9 +2032,19 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         return true;
     }
 
-    enum cpu_runcls cls = cpu_cls(cpu);
+    enum cpu_runcls cls = cpu_cls(cpu, 0);
     if ( cls == CPU_RT )
     {
+        bpf_cgroup_release(cgrp);
+        return true;
+    }
+
+    cnt_inc_pending(cpuc, cpu);
+
+    cls = cpu_cls(cpu, 0);
+    if ( cls == CPU_RT )
+    {
+        cnt_dec_pending(cpuc, cpu, 0, cgid);
         bpf_cgroup_release(cgrp);
         return true;
     }
@@ -2044,12 +2056,12 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         if (cpuc)
         {
             cgrp_dispatch_stat( cgid, cgc, cpuc );
-
-            cnt_inc_pending(cpuc, cpu);
         }
     }
     else
     {
+        cnt_dec_pending(cpuc, cpu, 0, cgid);
+
         if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, &cgv_tree_rt == cgv_tree, enq_count);
 
         if ( enq_count == 0 )
@@ -2206,12 +2218,12 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
     if (!cpuc->cur_bk_cgid)
         goto pick_next_cgroup;
 
-    enum cpu_runcls cls = cpu_cls(cpu);
+    enum cpu_runcls cls = cpu_cls(cpu, 0);
     if ( cls == CPU_RT )
     {
         stat_inc(FCG_STAT_CNS_GONE); // TODO: Remove this or create a dedicated stat
 
-        log("\tfcg_dispatch: CANCELLED on CPU %d as it is running RT (last BK %llu at %llu)", 1, cpu, cpuc->cur_bk_cgid, cpuc->cur_bk_at);
+        log("\tfcg_dispatch: CANCELLED on CPU %d as it is running RT (last BK %llu at %llu)", 0, cpu, cpuc->cur_bk_cgid, cpuc->cur_bk_at);
         return;
     }
 
@@ -2519,9 +2531,6 @@ void BPF_STRUCT_OPS(fcg_cgroup_move, struct task_struct *p,
     if ( cur_cpu >= nr_cpus )
         return;
 
-    log("\tfcg_cgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", 1, p->pid, cur_cpu, from->kn->id, to->kn->id);
-
-
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
     if ( cgrp )
     {
@@ -2532,6 +2541,8 @@ void BPF_STRUCT_OPS(fcg_cgroup_move, struct task_struct *p,
         }
     }
     bpf_cgroup_release(cgrp);
+
+    log("\tfcg_cgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", rt_class, p->pid, cur_cpu, from->kn->id, to->kn->id);
 
     struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
     if (!cpuc) return;
@@ -2575,7 +2586,6 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
     u32 cur_cpu = taskc->cur_cpu;
     if ( cur_cpu >= nr_cpus )
     {
-        log("\tfcg_task_exit: skipping task with pid %d as its cpu = %d", 1, p->pid, cur_cpu);
         return;
     }
 
@@ -2593,7 +2603,7 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
     }
     bpf_cgroup_release(cgrp);
 
-    log("\tfcg_task_exit: task with pid %d (cgid %llu) exiting!!!", 1, p->pid, cgid);
+    log("\tfcg_task_exit: task with pid %d (cgid %llu) exiting!!!", rt_class, p->pid, cgid);
 
     // TODO: Is this sufficient???
     cnt_dec( cpuc, rt_class, cur_cpu, p->pid, 0 );
