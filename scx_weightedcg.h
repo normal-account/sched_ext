@@ -65,28 +65,28 @@ struct fcg_cgrp_stats {
 	__u64 first_enq_ts;   	// 0 ==> not armed
 
 	__u64 lat_sum_ns;     	// accumulated activation latency
-    __u64 lat_cnt;        	// number of 
-	__u64 lat_max;
+    __u64 lat_cnt;        	// number of dispatches
+	__u64 lat_max;			// max latency encountered
 
-	__u64 dir_enq_cnt;
+	__u64 enq_idle_sum_ns;
+    __u64 enq_idle_cnt;
+	__u64 enq_idle_max;
+
+	__u64 enq_bk_sum_ns;
+    __u64 enq_bk_cnt;
+	__u64 enq_bk_max;
+
+	__u64 enq_rt_sum_ns;
+    __u64 enq_rt_cnt;
+	__u64 enq_rt_max;
+
+	__u64 enq_cnt;
 
 	__u64 move_lat_sum_ns;
 	__u64 move_lat_cnt;
 
 	u8  rt_class;    		// 1=RT, 0=BK
 	u32			weight;
-};
-
-struct fcg_buddy_key {
-    __u32 pid;       // waiter
-    __u32 buddy;     // inferred dependency (buddy)
-};
-
-struct fcg_buddy_val {
-    __u64 cnt;       // times 'buddy' was recorded for 'pid'
-    __u64 last_ts;   // scx_bpf_now() of last increment (debug)
-    __u32 last_cpu;  // CPU when we last incremented (debug)
-    __u32 _pad;
 };
 
 #ifndef DIR_ENQ
