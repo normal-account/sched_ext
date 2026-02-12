@@ -67,7 +67,7 @@ static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel)
 			{
 				if ( val.rt_class )
 				{
-					printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu idle cnt:%4luk idle avg:%6.4f idle max:%6.2f bk cnt:%4luk bk avg:%6.2f bk max:%6.2f rt cnt:%4luk rt avg:%6.2f rt max:%6.2f\n",
+					printf("CGRP LAT   name:%6s     RT:%6u weight:%6lu idle cnt:%4luk idle avg:%6.4f idle max:%6.2f bk cnt:%4luk bk avg:%6.4f bk max:%6.2f rt cnt:%4luk rt avg:%6.2f rt max:%6.2f\n",
 						val.name,
 						val.rt_class,
 						val.weight,

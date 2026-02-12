@@ -731,11 +731,11 @@ task_running_stat(struct task_struct *p, struct fcg_task_ctx *taskc,
     u64 lat_cnt = __sync_fetch_and_add(enq_cnt, 1);
     u64 lat_max = __sync_fetch_and_add(enq_max, 0);
 
-    if (lat_cnt > 100 && (lat > lat_max || (lat / 10000) >= 10 )) {
+    if (lat_cnt > 100 && (lat > lat_max || (lat / 10000) >= 1 )) {
         u64 lat_ms_int  = lat / 1000000;
         u64 lat_ms_frac = lat % 1000000;
 
-        log("\t\ttask_running_stat: NEW MAX with lat = %llu.%llu ms for pid %d (ts=%llu),", cgc->rt_class, lat_ms_int, lat_ms_frac, p->pid, ts);
+        log("\t\ttask_running_stat: NEW MAX %u with lat = %llu.%llu ms for pid %d (ts=%llu),", cgc->rt_class, taskc->rt_enq_bucket, lat_ms_int, lat_ms_frac, p->pid, ts);
 
         __sync_val_compare_and_swap(enq_max, lat_max, lat);
     }
@@ -1496,7 +1496,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             cnt_inc(tgtc, tgt, p->pid, true);
         } 
 
-        //rt_clear_claim( tgt, p->pid );
+        rt_clear_claim( tgt, p->pid );
 
         //if ( is_idle && scx_bpf_test_and_clear_cpu_idle(tgt) )
 
@@ -1700,8 +1700,8 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         {
             taskc->cur_cpu = cpu;
 
-            cnt_dec_pending(cpuc, cpu, p->pid, cgid);
             cnt_inc(cpuc, cpu, p->pid, cgc ? cgc->rt_class : 0);
+            cnt_dec_pending(cpuc, cpu, p->pid, cgid);
         }
 
         #if FCG_DEBUG
@@ -1844,6 +1844,19 @@ log_and_out:
         log("\tstopping: timeslice/yield pid %d comm %s on cpu %d (ran %llu ns)", rt_class, p->pid, p->comm, cpu, delta);
     }
 #endif 
+}
+
+#define DEQUEUE_SLEEP 1
+void BPF_STRUCT_OPS(fcg_dequeue, struct task_struct *p, u64 deq_flags)
+{
+    if (deq_flags & DEQUEUE_SLEEP)
+    {
+        log("\tfcg_dequeue: SLEEP pid %d comm %s", 1, p->pid, p->comm);
+    }
+    else 
+    {
+        log("\tfcg_dequeue: pid %d comm %s state %u", 1, p->pid, p->comm, p->__state);
+    }
 }
 
 void BPF_STRUCT_OPS(fcg_quiescent, struct task_struct *p, u64 deq_flags)
@@ -2195,6 +2208,8 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     return true;
 }
 
+
+// TODO: INVESTIGATE IF scx_bpf_dispatch_cancel() COULD BE USED
 void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 {
     if ( cpu < NR_CPUS_LOG )
@@ -2618,21 +2633,22 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
 }
 
 SCX_OPS_DEFINE(weightedcg_ops,
-        .select_cpu		= (void *) fcg_select_cpu,
+        .select_cpu		    = (void *) fcg_select_cpu,
         .enqueue			= (void *)fcg_enqueue,
-        .dispatch		= (void *)fcg_dispatch,
-        .runnable		= (void *)fcg_runnable,
+        .dispatch		    = (void *)fcg_dispatch,
+        .runnable		    = (void *)fcg_runnable,
         .running			= (void *)fcg_running,
-        .stopping		= (void *)fcg_stopping,
-        .quiescent		= (void *)fcg_quiescent,
-        .init_task		= (void *)fcg_init_task,
-        .exit_task      = (void *)fcg_exit_task,
+        .stopping		    = (void *)fcg_stopping,
+        .quiescent		    = (void *)fcg_quiescent,
+        .dequeue		    = (void *)fcg_dequeue,
+        .init_task		    = (void *)fcg_init_task,
+        .exit_task          = (void *)fcg_exit_task,
         .cgroup_set_weight	= (void *)fcg_cgroup_set_weight,
         .cgroup_init		= (void *)fcg_cgroup_init,
         .cgroup_exit		= (void *)fcg_cgroup_exit,
         .cgroup_move		= (void *)fcg_cgroup_move,
-        .init			= (void *)fcg_init,
-        .exit			= (void *)fcg_exit,
-        .flags			= SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST, //| SCX_OPS_SWITCH_PARTIAL,
-        .timeout_ms		= 0,//10000U,
-        .name			= "weightedcg");
+        .init			    = (void *)fcg_init,
+        .exit			    = (void *)fcg_exit,
+        .flags			    = SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST, //| SCX_OPS_SWITCH_PARTIAL,
+        .timeout_ms		    = 0,//10000U,
+        .name			    = "weightedcg");
