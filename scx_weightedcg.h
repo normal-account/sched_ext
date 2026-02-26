@@ -34,6 +34,12 @@ enum fcg_stat_idx {
 
 	FCG_STAT_BAD_REMOVAL,
 
+	FCG_STAT_BPF_DRAIN,
+	FCG_STAT_BPF_DRAIN_FAIL,
+	FCG_STAT_BPF_MSG,
+	FCG_STAT_BPF_CONFLICT,
+	FCG_STAT_BPF_BOOST,
+
 	FCG_NR_STATS,
 };
 
@@ -102,7 +108,7 @@ struct fcg_cgrp_stats {
 #endif
 
 #if FCG_DEBUG
-#define log(fmt, rt_class, ...) if ( true || rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( rt_class > 1 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
 #endif

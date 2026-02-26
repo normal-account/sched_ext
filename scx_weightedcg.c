@@ -8,13 +8,16 @@
 #include <fcntl.h>
 #include <time.h>
 #include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#include <errno.h>
 #include <scx/common.h>
-#include "scx_weightedcg.h"
-#include "scx_weightedcg.bpf.skel.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h> 
 
+#include "scx_weightedcg.h"
+#include "scx_weightedcg.bpf.skel.h"
 
 #ifndef FILEID_KERNFS
 #define FILEID_KERNFS		0xfe
@@ -171,6 +174,29 @@ static void fcg_read_stats(struct scx_weightedcg_bpf *skel, __u64 *stats)
 	}
 }
 
+static int pin_postgres_rb(struct scx_weightedcg_bpf *skel)
+{
+    const char *path = "/sys/fs/bpf/postgres_rb";
+    int err;
+
+    if (unlink(path) != 0 && errno != ENOENT) {
+        fprintf(stderr, "ERROR: unlink(%s) failed: %s\n", path, strerror(errno));
+        return -errno;
+    }
+
+    err = bpf_map__pin(skel->maps.postgres_rb, path);
+    if (err) {
+        fprintf(stderr, "ERROR: bpf_map__pin(%s) failed: %d\n", path, err);
+        return err;
+    }
+
+    if (chmod(path, 0777) != 0) {
+        fprintf(stderr, "ERROR: chmod(%s, 0777) failed: %s\n", path, strerror(errno));
+		return errno;
+    }
+
+    return 0;
+}
 int main(int argc, char **argv)
 {
 	struct scx_weightedcg_bpf *skel;
@@ -207,6 +233,8 @@ restart:
 
 	SCX_OPS_LOAD(skel, weightedcg_ops, scx_weightedcg_bpf, uei);
 	link = SCX_OPS_ATTACH(skel, weightedcg_ops, scx_weightedcg_bpf);
+
+	if (0 != pin_postgres_rb(skel)) return 1;
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		__u64 acc_stats[FCG_NR_STATS];
@@ -250,8 +278,15 @@ restart:
 		       stats[FCG_STAT_PNC_RACE],
 		       stats[FCG_STAT_PNC_FAIL],
 			   stats[FCG_STAT_PNC_AFFINITY]);
-		printf("BAD      remove:%6llu\n",
+		printf("BAD        remove:%6llu\n",
 		       acc_stats[FCG_STAT_BAD_REMOVAL]);
+
+		printf("BPF        drain:%6llu drain fail: %6llu msg:%6llu conflict :%6llu boost:%6llu\n",
+		       acc_stats[FCG_STAT_BPF_DRAIN],
+		       acc_stats[FCG_STAT_BPF_DRAIN_FAIL],
+		       acc_stats[FCG_STAT_BPF_MSG],
+		       acc_stats[FCG_STAT_BPF_CONFLICT],
+		       acc_stats[FCG_STAT_BPF_BOOST]);
 
 		fcg_read_cgrp_stats( skel );
 		
