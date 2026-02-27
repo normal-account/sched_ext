@@ -18,6 +18,7 @@ const volatile u64 task_slice_ns;
 const u32 NR_CPUS_LOG = 16;
 
 u64 cvtime_now;
+
 UEI_DEFINE(uei);
 
 struct {
@@ -43,6 +44,8 @@ struct fcg_cpu_ctx {
     u64         rt_cnt;
     u64         bk_cnt;
     u64         bk_cnt_pending;
+
+    u64 rt_vtime_now;   // min-vtime base for RT tasks on this CPU
 
     u32 rt_claim_pid;  // 0 = free, else pid that reserved this cpu for RT
 
@@ -90,9 +93,7 @@ struct {
 } cgv_node_stash SEC(".maps");
 
 struct fcg_task_ctx {
-    u64		bypassed_at;
     u64     enq_cgid;       // cgroup we credited enq_count to
-    u8      rt_class;
     
     u32     sel_cls;
     u32     sel_cpu;
@@ -167,8 +168,6 @@ static __always_inline bool increment_enq_count( struct fcg_task_ctx *taskc, str
     // Win once per residency: 0 -> cgid
     if (__sync_val_compare_and_swap(&taskc->enq_cgid, 0, cgid) == 0) 
     {
-        taskc->rt_class = cgc->rt_class;
-
         u64 old = __sync_fetch_and_add(&cgc->enq_count, 1);
     
         if ( 0 == old )
@@ -211,7 +210,7 @@ static __always_inline void decrement_enq_count( struct fcg_task_ctx *taskc, str
             
             if ( 1 == old )
             {
-                cls_dec(taskc->rt_class);
+                cls_dec(cgc->rt_class);
             }
         }
     }
@@ -228,8 +227,6 @@ static __always_inline void cnt_inc(struct fcg_cpu_ctx *cpuc, u32 cpu, s32 pid, 
     if (!cpuc) return;
     if (is_rt) __sync_fetch_and_add(&cpuc->rt_cnt, 1);
     else       __sync_fetch_and_add(&cpuc->bk_cnt, 1);
-
-    log("\tcnt_inc: incrementing on cpu %u for pid %d (is_rt=%u)", is_rt, cpu, pid, (u32)is_rt );
 }
 
 static __always_inline void cnt_inc_pending(struct fcg_cpu_ctx *cpuc, u32 cpu)
@@ -237,14 +234,10 @@ static __always_inline void cnt_inc_pending(struct fcg_cpu_ctx *cpuc, u32 cpu)
     if (!cpuc) return;
     
     __sync_fetch_and_add(&cpuc->bk_cnt_pending, 1);
-
-    log("\tcnt_inc_pending: incrementing PENDING on cpu %u", 0, cpu);
 }
 
 static __always_inline void cnt_dec_pending(struct fcg_cpu_ctx *cpuc, u32 cpu, s32 pid, u64 cgid)
 {
-    log("\tcnt_dec_pending: decrementing on cpu %u for task %d (cgid %u)", 0, cpu, pid, cgid);
-
     if (!cpuc) {
         scx_bpf_error("cnt_dec_pending: cpuc NULL for cpu %u", cpu);
         return;
@@ -256,8 +249,6 @@ static __always_inline void cnt_dec_pending(struct fcg_cpu_ctx *cpuc, u32 cpu, s
     if (old == 0) {
         log("\tcnt_dec_pending: ERROR, cnt PENDING underflow on cpu %u", 0, cpu);
         __sync_fetch_and_add(&cpuc->bk_cnt_pending, 1);
-
-        //scx_bpf_error("cnt underflow for cpu %u (rt=%u)", cpu, (u32)is_rt);
     }
 }
 
@@ -269,8 +260,6 @@ static __always_inline void cnt_dec(struct fcg_cpu_ctx *cpuc, bool is_rt, u32 cp
     }
 
     u64 *cnt_ptr = is_rt ? &cpuc->rt_cnt : &cpuc->bk_cnt;
-
-    log("\tcnt_dec: decrementing on cpu %u for task %d (cgid %u, is_rt=%u, cur_cnt=%llu)", is_rt, cpu, pid, cgid, (u32)is_rt, *cnt_ptr);
 
     // atomic decrement; returns previous value
     u64 old = __sync_fetch_and_sub(cnt_ptr, 1);
@@ -428,48 +417,6 @@ static __always_inline void fcg_dump_cgroup_tasks( u32 pid, u64 cgid, u64 vtime 
 
     log("TASK_VTIME_DUMP_END cgid=%llu", 0, cgid);
 }
-
-// Debug helper: dump all entries of cur_cgid (keys 0..nr_cpus-1)
-// static void dump_cur_cgid(int start, int rt_class)
-// {
-//     u32 i;
-//     if (start)
-//     {
-//         log("\t\tcur_cgid: RUNNING dump begin (nr_cpus=%u)", rt_class, nr_cpus);
-//     }
-//     else
-//     {
-//         log("\t\tcur_cgid: STOPPED dump begin (nr_cpus=%u)", rt_class, nr_cpus);
-//     }
-
-//     bpf_for(i, 0, FCG_CPU_MASK_BITS) {
-//         if (i >= NR_CPUS_LOG)
-//             break;
-
-//         struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &i);
-//         u64 val = cpuc ? __sync_fetch_and_add(&cpuc->cur_cgid, 0) : 0;
-//         if (0 != val) {
-//             struct cgroup *cg = bpf_cgroup_from_id(val);
-//             if (cg) {
-//                 char namebuf[32];
-//                 bpf_probe_read_kernel(&namebuf, sizeof(namebuf), cg->kn->name);
-//                 log("\t\t\tcur_cgid[%u] = %llu (name=%s)", rt_class, i, val, namebuf);
-//                 bpf_cgroup_release(cg);
-//             } else {
-//                 log("\t\t\tcur_cgid[%u] = %llu (lookup failed)", rt_class, i, val);
-//             }
-//         }
-//     }
-
-//     if (start)
-//     {
-//         log("\t\tcur_cgid: RUNNING dump end", rt_class);
-//     }
-//     else
-//     {
-//         log("\t\tcur_cgid: STOPPED dump end", rt_class);
-//     }
-// }
 
 #endif /* FCG_DEBUG */
 
@@ -670,8 +617,6 @@ task_enqueue_stat(struct task_struct *p, struct fcg_task_ctx *taskc, u64 cgid, b
         {
             taskc->rt_enq_bucket = CPU_RT;
         }
-
-        log("\ttask_enqueue_stat: setting first_enq_ts = %llu for pid %d", 1, ts, p->pid);
     }
 #endif
 }
@@ -1042,19 +987,6 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct fcg_cgrp_ctx *cgc)
     }
 
     bpf_spin_unlock(&cgv_tree_lock);
-
-    //fcg_dump_bk_tree();
-}
-
-static void set_bypassed_at(struct task_struct *p, struct fcg_task_ctx *taskc)
-{
-    /*
-    * Tell fcg_stopping() that this bypassed the regular scheduling path
-    * and should be force charged to the cgroup. 0 is used to indicate that
-    * the task isn't bypassing, so if the current runtime is 0, go back by
-    * one nanosecond.
-    */
-    taskc->bypassed_at = p->se.sum_exec_runtime ?: (u64)-1;
 }
 
 static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid, bool is_idle)
@@ -1085,19 +1017,10 @@ static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid, bool is_idle)
 static __always_inline void rt_clear_claim(u32 cpu, u32 pid)
 {
     struct fcg_cpu_ctx *cpuc = find_cpu_ctx(cpu);
-    //struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
     if (cpuc) 
     {
-        u32 prev_pid = __sync_val_compare_and_swap(&cpuc->rt_claim_pid, pid, 0);
         // Clear only if this task owns the claim
-        if ( prev_pid != pid )
-        {
-            log("rt_clear_claim: Cannot clear claim for pid %u on cpu %u (prev pid=%u)!", 1, pid, cpu, prev_pid);
-        }
-        else
-        {
-            log("rt_clear_claim: clearing claim for pid %u on cpu %u (New value: %u)!", 1, pid, cpu, cpuc->rt_claim_pid);
-        }
+        u32 prev_pid = __sync_val_compare_and_swap(&cpuc->rt_claim_pid, pid, 0);
     }
 }
 
@@ -1219,7 +1142,7 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
                 enum cpu_runcls cls = cpu_cls(idx, p->pid);
 
                 if (cls == CPU_IDLING) {
-                    log("cpu IDLE=%u (cls=%u)", 1, idx);
+                    log("cpu IDLE=%u (cls=%u)", 2, idx);
 
                     // Try to claim immediately; if fails, keep scanning.
                     if (rt_try_claim_cpu(idx, pid, true)) {
@@ -1234,8 +1157,7 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
                         best_rt = idx;
                     }
                 } else {
-
-                    log("cpu NOT IDLE=%u (cls=%u)", 1, idx, (u32)cls);
+                    //log("cpu NOT IDLE=%u (cls=%u)", 1, idx, (u32)cls);
 
                     u32 load = cpu_load_for_pick(idx);
 
@@ -1261,7 +1183,7 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
         }
 
 
-        log("pick_cpu_to_kick_for_rt: best bk=%u and rt=%u for pid %d", 1, best_bk, best_rt, p->pid);
+        log("pick_cpu_to_kick_for_rt: best bk=%u and rt=%u for pid %d", 2, best_bk, best_rt, p->pid);
 
         // Prefer BK, but claim deterministically before returning.
         if (best_bk != nr_cpus) {
@@ -1305,7 +1227,7 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
         }
     }
 
-    log("pick_cpu_to_kick_for_rt: FOUND NOTHING for pid %d", 1, p->pid);
+    log("pick_cpu_to_kick_for_rt: FOUND NOTHING for pid %d", 2, p->pid);
 
     return nr_cpus;
 }
@@ -1331,14 +1253,14 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     {
         if ( taskc->last_cpu != nr_cpus && taskc->last_cpu != prev_cpu )
         {
-            log("\tfcg_select_cpu: MISMATCH in select_cpu, taskc->last_cpu=%u while prev_cpu=%d", 1, taskc->last_cpu, prev_cpu);
+            log("\tfcg_select_cpu: MISMATCH in select_cpu, taskc->last_cpu=%u while prev_cpu=%d", 2, taskc->last_cpu, prev_cpu);
         }
 
 
         taskc->sel_cpu = pick_cpu_to_kick_for_rt(p, prev_cpu, &is_idle, &is_idle);
         taskc->sel_cls = cpu_cls(taskc->sel_cpu, p->pid);
 
-        log("\tfcg_select_cpu: setting SEL CPU %d for pid %d (cls=%u)", 1, taskc->sel_cpu, p->pid, (u32)taskc->sel_cls);
+        log("\tfcg_select_cpu: setting SEL CPU %d for pid %d (cls=%u)", 2, taskc->sel_cpu, p->pid, (u32)taskc->sel_cls);
 
         bpf_cgroup_release(cgrp);
 
@@ -1414,15 +1336,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     if (!cgc)
         goto out_release;
 
-    u64 tvtime = p->scx.dsq_vtime;
-
-    /*
-    * Limit the amount of budget that an idling task can accumulate
-    * to one slice.
-    */
-    if (time_before(tvtime, cgc->tvtime_now - task_slice_ns))
-        tvtime = cgc->tvtime_now - task_slice_ns;
-
 
     u64 cgid = cgrp->kn->id;
 
@@ -1440,9 +1353,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         enum cpu_runcls cls = cpu_cls(taskc->sel_cpu, 0);
 
-        //if ( ( enq_flags & SCX_ENQ_REENQ ) == 0 && sel_cpu_allowed )
-        //if ( sel_cpu_allowed )
-        //if ( sel_cpu_allowed && ( cls != CPU_RT || cls == taskc->sel_cls ) )
         if ( sel_cpu_allowed && cls == CPU_IDLING )
         {
             tgt = taskc->sel_cpu;
@@ -1463,59 +1373,67 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
             log("\tfcg_enqueue: using PICKED CPU %d for pid %d (is idle=%d, can_kick=%d)", cgc->rt_class, tgt, p->pid, is_idle, can_kick);
 
-            //if ( !is_idle && sel_cpu_allowed )
-            //{
-            //    tgt = taskc->sel_cpu;
-            //}
-
             stat_inc(FCG_STAT_PNC_AFFINITY);
         }
 
+        tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
+
+        // Task accounting
         task_enqueue_stat( p, taskc, cgid, is_idle, can_kick );
-
         taskc->sel_cpu = nr_cpus;
-    }
 
-#ifdef DIR_ENQ
-    if (tgt >= 0 && tgt < nr_cpus)
-    {
-        set_bypassed_at(p, taskc);
+        bool is_behind = false;
+        if (tgtc)
+        {
+            if ( !is_idle && !can_kick )
+            {
+                // Determine if task should be enqueued at head or not
+                u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
+                u64 tv    = p->scx.dsq_vtime;
+                u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
 
+                s64 d = time_delta(now_v, tv);   // signed
+                is_behind = d > (s64)slack_v;
+
+                 log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
+            }
+
+            cnt_inc(tgtc, tgt, p->pid, true);
+        }
+        
+        // Task direct enqueue 
         u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
 
-        if ( is_idle || can_kick ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+        if ( is_idle || can_kick || is_behind ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
-        // TODO: Use insert vtime here?
-        scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns/*SCX_SLICE_INF*/, rt_flags );
+        scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, /*SCX_SLICE_INF*/task_slice_ns, rt_flags );
 
         taskc->cur_cpu = tgt;
 
-        tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
-        if (tgtc)
-        {
-            cnt_inc(tgtc, tgt, p->pid, true);
-        } 
-
         rt_clear_claim( tgt, p->pid );
-
-        //if ( is_idle && scx_bpf_test_and_clear_cpu_idle(tgt) )
 
         if ( is_idle )
         {
             log("\tfcg_enqueue: direct kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
             scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-            //scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
         }
-        else if ( can_kick )//|| is_idle )
+        else if ( can_kick || is_behind )//|| is_idle )
         {
-            log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
+            log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", /*cgc->rt_class*/2, tgt, p->pid);
             scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
         }
-
-        goto out_release;
     }
     else
     {
+        u64 tvtime = p->scx.dsq_vtime;
+
+        /*
+        * Limit the amount of budget that an idling task can accumulate
+        * to one slice.
+        */
+        if (time_before(tvtime, cgc->tvtime_now - task_slice_ns))
+            tvtime = cgc->tvtime_now - task_slice_ns;
+
         log("\tfcg_enqueue: NOT A DIRECT ENQUEUE ON CPU %d for pid %d on cgid %llu with slice %llu", cgc->rt_class, tgt, p->pid, cgid, task_slice_ns);
 
         // Credit once per DSQ residency
@@ -1528,27 +1446,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         // TODO: REMOVE
         //fcg_dump_cgroup_tasks(p->pid, cgid, p->scx.dsq_vtime);
     }
-#else
-    increment_enq_count( taskc, cgc, cgid );
-
-    cgrp_enqueued(cgrp, cgc);
-
-    scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
-
-    if (tgt >= 0 && tgt < nr_cpus)
-    {
-        if ( is_idle )
-        {
-            log("\tfcg_enqueue: kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
-            scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-        }
-        else
-        {
-            log("\tfcg_enqueue: kick PREEMPT CPU %d for pid %d ", cgc->rt_class, tgt, p->pid);
-            scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
-        }
-    }
-#endif
 
     log("\tfcg_enqueue: enqueue task %d (cgid %llu, q=%d) slice=%llu enq_count=%llu", cgc->rt_class, p->pid, cgrp->kn->id,
         scx_bpf_dsq_nr_queued(cgrp->kn->id), cgrp_slice_ns, cgc->enq_count);
@@ -1713,19 +1610,14 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
 
     if (cgc) 
     {
-        //if (should_log(p->comm, 0))
-        {
-            //dump_cur_cgid(1, cgc->rt_class);
-        }
-
-#ifdef DIR_ENQ
         if ( cgc->rt_class )
+        {
             task_running_stat( p, taskc, cgid, cgc );
+        }
         else
+        {
             cgrp_running_stat( cgid, cgc, cpuc );
-#else
-        cgrp_running_stat( cgid, cgc, cpuc );
-#endif
+        }
 
         // Decrement the enq_count if applicable and set the enq cgid to 0
         decrement_enq_count( taskc, cgc, cgid );
@@ -1750,6 +1642,8 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     struct fcg_cgrp_ctx *cgc;
 
     u32 cpu = bpf_get_smp_processor_id();
+    struct fcg_cpu_ctx *cpuc = find_cpu_ctx(cpu);
+
 
     int rt_class = 0;
     /*
@@ -1778,21 +1672,12 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
 
     rt_class = cgc && cgc->rt_class;
 
-    if (!taskc->bypassed_at)
+    if ( cpuc && cgc && cgc->rt_class )
     {
-        goto log_and_out;
-    }
-
-    // TODO - REMOVE
-    //if (taskc->bypassed_at) {
-    //    u64 used = p->se.sum_exec_runtime - taskc->bypassed_at;
-    //    log("\tstopping: bypass charge %llu ns to cgid", rt_class, used);
-    //}
-
-    if (cgc) {
-        __sync_fetch_and_add(&cgc->cvtime_delta,
-                    p->se.sum_exec_runtime - taskc->bypassed_at);
-        taskc->bypassed_at = 0;
+        u64 v = p->scx.dsq_vtime;
+        u64 cur = __sync_fetch_and_add(&cpuc->rt_vtime_now, 0);
+        if (time_before(cur, v))
+            __sync_val_compare_and_swap(&cpuc->rt_vtime_now, cur, v);
     }
 
 log_and_out:
@@ -1823,17 +1708,6 @@ log_and_out:
     if ( !runnable )
     {
         log("\tstopping: cpu %d sleep pid %d comm %s (cur_cgid cleared, ran %llu ns)", rt_class, cpu, p->pid, p->comm, delta);
-
-        // Only clear if it's not runnable anymore, as preemption or 
-        // timeslice yield guarantees that another task is on the queue.
-        // Clearing between 2 tasks running introduces race conditions where a 3rd task would see CPU as idle.
-
-        // if (cpuc && scx_bpf_dsq_nr_queued( SCX_DSQ_LOCAL_ON | cpu ) == 0)
-        // {
-        //     __sync_val_compare_and_swap(&cpuc->cur_cgid, cgid, 0);
-        // }
-
-        // TODO: This is still problematic as 2 tasks could still be on the queue. Find a way to only clear if not.
     }
     else if (p->scx.slice > 0)
     {
@@ -2027,14 +1901,14 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
         bpf_spin_lock(&cgv_tree_lock);
 
-        // remove-first under the lock, but only if the head is the one we peeked
+        // Remove-first under the lock, but only if the head is the one we peeked.
         struct bpf_rb_node *removed = NULL;
         struct cgv_node *bumped = NULL;
 
         remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
 
         if (removed && bumped) {
-            /* epsilon bump: reorder only, do NOT “charge” budget here */
+            // Reorder to prevent Head-of-Line blocking because of CPU affinity.
             bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
             bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
         }
@@ -2100,11 +1974,9 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         }
 
 
-        // --- FIX STARTS HERE ---
-        
-        // Tasks exist (qsz > 0), but move_to_local returned 0.
-        // This means tasks are pinned to other CPUs. We must rotate the tree
-        // to avoid Head-of-Line blocking.
+        /* Tasks exist (qsz > 0), but move_to_local returned 0.
+        * This means tasks are pinned to other CPUs. We must rotate the tree
+        * to avoid Head-of-Line blocking. */
 
         char cg_name_buf[32];
         bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp->kn->name);
@@ -2120,8 +1992,9 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
 
         if (removed && bumped) {
-            /* * Charge a slice delta (or epsilon) to rotate it to the back 
-             * so we can get to the next cgroup. 
+            /* 
+             * Charging a slice delta to rotate it to the back 
+             * so we can get to the next cgroup.
              */
             bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
             bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
@@ -2131,12 +2004,6 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         
         bpf_cgroup_release(cgrp);
         return true; // Return true so fcg_dispatch loop tries the next node
-        
-        // --- FIX ENDS HERE ---
-
-        //stat_inc(FCG_STAT_PNC_AFFINITY);
-        //bpf_cgroup_release(cgrp);
-        //return false;
     }
 
     /*
@@ -2154,21 +2021,18 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     struct cgv_node *cgv_node2 = NULL;
     struct bpf_rb_node *rb_node2 = bpf_rbtree_first(cgv_tree);
 
-
     if ( rb_node2 && remove_first_tree_node( cgv_tree, rb_node, &removed, &cgv_node2, false ) )
     {
         // Advance cvtime_now if needed before charging
         if (time_before(cvtime_now, cgv_node2->cvtime))
             cvtime_now = cgv_node2->cvtime;
-        
+
         /*
         * Note that here we charge the full slice upfront and then exact later
         * according to the actual consumption. This prevents lowpri thundering
         * herd from saturating the machine.
         */
-        u64 before = cgv_node2->cvtime; 
         cgv_node2->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
-        u64 between = cgv_node2->cvtime; 
         cgrp_cap_budget(cgv_node2, cgc); 
         
         bpf_rbtree_add(cgv_tree, &cgv_node2->rb_node, cgv_node_less);
@@ -2183,7 +2047,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
             scx_bpf_error( "CVTIME OVERFLOW!");
         }
 
-        log("\ttry_pick_next_cgroup: REMOVED and ADDED cgid %llu (cvtime=%llu, before=%llu, between=%llu) back to its tree!", cgc->rt_class, cgid, cvtime, before, between );
+        log("\ttry_pick_next_cgroup: REMOVED and ADDED cgid %llu (cvtime=%llu) back to its tree!", cgc->rt_class, cgid, cvtime );
     
         *cgidp = cgid;
         stat_inc(FCG_STAT_PNC_NEXT);
@@ -2199,6 +2063,9 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
     log("\tfcg_dispatch: try_pick_next_cgroup picked new cgroup %llu for cpu %d, but came back to an empty head...", cgc->rt_class, cgid, cpu );
 
+    /* We couldn't get a hold of the cvg_node, so we can't charge the full slice directly.
+    *  We can compensate by adding a full slice to the cvtime_delta instead.
+    */
     __u64 delta = (cgrp_slice_ns * FCG_HWEIGHT_ONE) / (cgc->hweight ?: 1);
     __sync_fetch_and_add(&cgc->cvtime_delta, delta);
 
@@ -2212,15 +2079,6 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 // TODO: INVESTIGATE IF scx_bpf_dispatch_cancel() COULD BE USED
 void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 {
-    if ( cpu < NR_CPUS_LOG )
-    {
-        //log("\tfcg_dispatch: called for cpu %d (tree sizes rt=%u bk=%u)", 0, cpu, cls_get_rt(), cls_get_bk());
-    }
-    else
-    {
-        //return;
-    }
-
     struct fcg_cpu_ctx *cpuc;
     struct fcg_cgrp_ctx *cgc;
     struct cgroup *cgrp;
@@ -2242,7 +2100,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         return;
     }
 
-    if (false && time_before(now, cpuc->cur_bk_at + cgrp_slice_ns)) {
+    if ( time_before(now, cpuc->cur_bk_at + cgrp_slice_ns)) {
 
         // Update the non-empty count for RT/BK trees
         cgrp = bpf_cgroup_from_id(cpuc->cur_bk_cgid);
@@ -2256,7 +2114,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
             log("\tfcg_dispatch: Should we stay on same CPU %d for cgroup %llu with rt=%llu", 0, cpu, cpuc->cur_bk_cgid, cls_get_rt());
 
             bpf_cgroup_release( cgrp );
-            goto pick_next_cgroup;  // jump to the RT try_pick_next_cgroup path
+            goto pick_next_cgroup;
         }
         
         if (scx_bpf_dsq_move_to_local(cpuc->cur_bk_cgid)) {
@@ -2305,28 +2163,19 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         goto pick_next_cgroup;
     }
 
-    // TODO: ADD BACK
     // cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
     // if (cgc && cpuc->cur_bk_at > 0) {
-    //     bpf_spin_lock(&cgv_tree_lock);
-
-    //     u64 expected_end = cpuc->cur_bk_at + cgrp_slice_ns;
-    //     u64 delta_ns = 0;
-
-    //     if (now < expected_end)   // finished early -> refund
-    //         delta_ns = expected_end - now;
-    //     else                      // finished late or exact -> no refund
-    //         delta_ns = 0;
-
-    //     u32 weight = cgc->hweight ?: 1;
-    //     u64 inc = (delta_ns * FCG_HWEIGHT_ONE) / weight;
-
-    //     __sync_fetch_and_add(&cgc->cvtime_delta, inc);
-
-    //     bpf_spin_unlock(&cgv_tree_lock);
-
-    //     //log("\tfcg_dispatch: new delta on cpu %d for cgid %llu = %llu (prev=%llu, cur_at=%llu, now=%llu)",
-    //     //    0, cpu, cgrp->kn->id, cgc->cvtime_delta, prev_delta, cpuc->cur_bk_at, now);
+    //     // TODO: Is this a bug? Why are we charging extra debt if a task finishes early???v
+	// 	/*
+	// 	 * We want to update the vtime delta and then look for the next
+	// 	 * cgroup to execute but the latter needs to be done in a loop
+	// 	 * and we can't keep the lock held. Oh well...
+	// 	 */
+	// 	bpf_spin_lock(&cgv_tree_lock);
+	// 	__sync_fetch_and_add(&cgc->cvtime_delta,
+	// 			     (cpuc->cur_bk_at + cgrp_slice_ns - now) *
+	// 			     FCG_HWEIGHT_ONE / (cgc->hweight ?: 1));
+	// 	bpf_spin_unlock(&cgv_tree_lock);
     // } else {
     //     stat_inc(FCG_STAT_CNS_GONE);
     // }
@@ -2336,36 +2185,6 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 pick_next_cgroup:
     cpuc->cur_bk_at = now;
     cpuc->cur_bk_cgid = 0;
-    // TODO: This is not needed. Remove and make sure it doesn't cause regression.
-    // cpuc->cur_cgid = 0;
-
-    u32 fallback_q = scx_bpf_dsq_nr_queued(FALLBACK_DSQ);
-    if (scx_bpf_dsq_move_to_local(FALLBACK_DSQ)) {
-        scx_bpf_error("FOUND TASK IN FALLBACK_DSQ!?!?!");
-        return;
-    }
-
-    // TEMPORARY DISABLED FOR SIMPLER TESTING
-    if (cls_get_rt() == 0) {
-        // skip probing the RT tree this round and go straight to BK
-        goto pick_from_BG;
-    }
-
-    if ( cpu < NR_CPUS_LOG ) 
-        log("\tfcg_dispatch: pick_next_cgroup trying to move RT to local (size %u) on cpu %d", 1, cls_get_rt(), cpu);
-
-    bpf_repeat(CGROUP_MAX_RETRIES) {
-        if (try_pick_next_cgroup( &cpuc->cur_bk_cgid, &cgv_tree_rt, cpu, cpuc )) {
-            if (cpuc->cur_bk_cgid)   // non-zero only when we actually moved a DSQ
-            {
-                return;
-            }
-            //break;
-        }
-       // break;
-    }
-
-pick_from_BG:
 
     if ( cls_get_bk() != 0 )
     {
@@ -2379,7 +2198,6 @@ pick_from_BG:
                     return;
                 }
             }
-            //break;
         }
     }
     else
@@ -2387,7 +2205,6 @@ pick_from_BG:
         if ( cpu < NR_CPUS_LOG )
             log("\t\t\tfcg_dispatch: both trees are empty when called for cpu %d???", 0, cpu);
     }
-
 
     /*
     * This only happens if try_pick_next_cgroup() races against enqueue
@@ -2418,10 +2235,10 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
     if (!taskc)
         return -ENOMEM;
 
-    taskc->bypassed_at      = 0;
     taskc->cur_cpu          = nr_cpus;
     taskc->sel_cpu          = nr_cpus;
     taskc->last_cpu         = nr_cpus;
+    taskc->enq_cgid         = 0;
 
     if (!(cgc = find_cgrp_ctx(args->cgroup)))
         return -ENOENT;
