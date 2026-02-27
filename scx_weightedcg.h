@@ -94,7 +94,7 @@ struct fcg_cgrp_stats {
 #endif
 
 #ifndef FCG_DEBUG
-#define FCG_DEBUG 1
+#define FCG_DEBUG 0
 #endif
 
 #ifndef FCG_BUDDIES

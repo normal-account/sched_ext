@@ -1332,10 +1332,20 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     }
 
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+
+    if (p->flags & PF_KTHREAD) {
+        // Kernel workers MUST NOT be starved by RT tasks.
+        // Send them directly to the local DSQ head.
+        log("\tfcg_enqueue: local enqueue for kernel worker with pid %d", 1, p->pid);
+
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
+        bpf_cgroup_release(cgrp);
+        return;
+    }
+
     cgc = find_cgrp_ctx(cgrp);
     if (!cgc)
         goto out_release;
-
 
     u64 cgid = cgrp->kn->id;
 
