@@ -1334,8 +1334,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
 
     if (p->flags & PF_KTHREAD) {
-        // Kernel workers MUST NOT be starved by RT tasks.
-        // Send them directly to the local DSQ head.
+        // Kernel workers must never be starved by RT tasks.
         log("\tfcg_enqueue: local enqueue for kernel worker with pid %d", 1, p->pid);
 
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
@@ -1366,7 +1365,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         if ( sel_cpu_allowed && cls == CPU_IDLING )
         {
             tgt = taskc->sel_cpu;
-            //enum cpu_runcls cls = cpu_cls(tgt);
 
             log("\tfcg_enqueue: using CACHED CPU %d for pid %d (cls=%u)", cgc->rt_class, tgt, p->pid, (u32)cls);
 
@@ -1416,7 +1414,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         if ( is_idle || can_kick || is_behind ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
-        scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, /*SCX_SLICE_INF*/task_slice_ns, rt_flags );
+        scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
 
         taskc->cur_cpu = tgt;
 
@@ -1427,7 +1425,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             log("\tfcg_enqueue: direct kick IDLE CPU %d for pid %d", cgc->rt_class, tgt, p->pid);
             scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
         }
-        else if ( can_kick || is_behind )//|| is_idle )
+        else if ( can_kick || is_behind )
         {
             log("\tfcg_enqueue: direct kick PREEMPT CPU %d for pid %d ", /*cgc->rt_class*/2, tgt, p->pid);
             scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
