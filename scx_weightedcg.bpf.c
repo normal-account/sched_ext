@@ -791,7 +791,7 @@ struct {
 
 static long pg_rb_cb(const struct bpf_dynptr *dynptr, void *ctx)
 {
-    //return 0;
+    return 0;
     stat_inc(FCG_STAT_BPF_MSG);
 
     struct pg_wait_event ev = {};
@@ -814,10 +814,10 @@ static long pg_rb_cb(const struct bpf_dynptr *dynptr, void *ctx)
 
     if (ev.is_start)
     {
-        log("\tpg_rb_cb: WAIT START pid=%d owner pid=%d type=%u lock=0x%x", 2, ev.pid, ev.owner_pid, ev.type, ev.lock);
+        log("\tpg_rb_cb: WAIT START %s pid=%d owner pid=%d type=%u lock=0x%x", 2, ev.event_info == 0x01000000U ? "LWLOCK" : "SPINLOCK", ev.pid, ev.owner_pid, ev.type, ev.lock);
     }
     else{
-        log("\tpg_rb_cb: WAIT END pid=%d type=%u", 2, ev.pid, ev.type);
+        log("\tpg_rb_cb: WAIT END %s pid=%d type=%u", 2, ev.event_info == 0x01000000U ? "LWLOCK" : "SPINLOCK", ev.pid, ev.type);
     }
 
 
@@ -1842,7 +1842,7 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         #endif
     }
 
-    log("\trunning cpu=%d: pid %d comm %s (cur_cgid <= %llu, slice=%llu)", /*(cgc ? cgc->rt_class : 0)*/2, cpu, p->pid, p->comm, cgid, p->scx.slice);
+    log("\trunning cpu=%d: pid %d comm %s (cur_cgid <= %llu, slice=%llu)", (cgc ? cgc->rt_class : 0), cpu, p->pid, p->comm, cgid, p->scx.slice);
 
     if (cgc) 
     {
