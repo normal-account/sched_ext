@@ -234,15 +234,20 @@ restart:
 		       stats[FCG_STAT_HWT_UPDATES],
 		       stats[FCG_STAT_HWT_SKIP],
 		       stats[FCG_STAT_HWT_RACE]);
-		printf("ENQUEUE    skip:%6llu   race:%6llu\n",
+		printf("ENQUEUE    skip:%6llu   race:%6llu kworkr:%6llu  napi:%6llu  softirq:%6llu  wq worker:%6llu  kthread:%6llu\n",
 		       stats[FCG_STAT_ENQ_SKIP],
-		       stats[FCG_STAT_ENQ_RACE]);
+		       stats[FCG_STAT_ENQ_RACE],
+			   stats[FCG_STAT_ENQ_IRQ],
+			   stats[FCG_STAT_ENQ_NAPI],
+			   stats[FCG_STAT_ENQ_KSOFTIRQD],
+			   stats[FCG_STAT_ENQ_WQ_WORKER],
+			   stats[FCG_STAT_ENQ_KTHREAD]);
 		printf("DISPATCH   keep:%6llu expire:%6llu  empty:%6llu  gone:%6llu\n",
 		       stats[FCG_STAT_CNS_KEEP],
 		       stats[FCG_STAT_CNS_EXPIRE],
 		       stats[FCG_STAT_CNS_EMPTY],
 		       stats[FCG_STAT_CNS_GONE]);
-		printf("PICK NEXT  next:%6llu  empty:%6llu nocgrp:%6llu  gone:%6llu race:%6llu fail:%6llu aff-fail:%6llu\n",
+		printf("PICK NEXT  next:%6llu  empty:%6llu nocgrp:%6llu  gone:%6llu     race:%6llu       fail:%6llu aff-fail:%6llu\n",
 		       stats[FCG_STAT_PNC_NEXT],
 		       stats[FCG_STAT_PNC_EMPTY],
 		       stats[FCG_STAT_PNC_NO_CGRP],

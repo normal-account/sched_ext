@@ -18,6 +18,11 @@ enum fcg_stat_idx {
 
 	FCG_STAT_ENQ_SKIP,
 	FCG_STAT_ENQ_RACE,
+	FCG_STAT_ENQ_IRQ,
+	FCG_STAT_ENQ_KSOFTIRQD,
+	FCG_STAT_ENQ_NAPI,
+	FCG_STAT_ENQ_WQ_WORKER,
+	FCG_STAT_ENQ_KTHREAD,
 
 	FCG_STAT_CNS_KEEP,
 	FCG_STAT_CNS_EXPIRE,
@@ -102,7 +107,7 @@ struct fcg_cgrp_stats {
 #endif
 
 #if FCG_DEBUG
-#define log(fmt, rt_class, ...) if (  rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( true || rt_class == 2 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
 #endif

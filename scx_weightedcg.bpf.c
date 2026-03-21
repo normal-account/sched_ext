@@ -15,7 +15,7 @@ const volatile u32 nr_cpus;	/* !0 for veristat, set during init */
 const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
 
-const u32 NR_CPUS_LOG = 16;
+const u32 NR_CPUS_LOG = 96;
 
 u64 cvtime_now;
 
@@ -1318,6 +1318,134 @@ log("  - unknown_bits: 0x%llx", 0, unknown);
 }
 }
 
+static __always_inline bool starts_with(const char s[TASK_COMM_LEN],
+                                        const char *prefix)
+{
+#pragma unroll
+    for (int i = 0; i < TASK_COMM_LEN; i++) {
+        char pc = prefix[i];
+        char sc = s[i];
+
+        if (pc == '\0')
+            return true;   // matched the whole prefix
+
+        if (sc == '\0')
+            return false;  // string ended before prefix
+
+        if (sc != pc)
+            return false;  // mismatch
+    }
+
+    return false; // prefix longer than TASK_COMM_LEN
+}
+
+////////// TODO BEGIN REMOVE //////////////
+
+
+enum task_boost_class {
+    BOOST_NONE      = 0,
+    BOOST_IRQ       = 1 << 0,
+    BOOST_KSOFTIRQD = 1 << 1,
+    BOOST_NAPI      = 1 << 2,
+    BOOST_WQ        = 1 << 3,
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 131072);
+    __type(key, u32);   // pid
+    __type(value, u32); // enum task_boost_class bitmask
+} task_boost_map SEC(".maps");
+
+static __always_inline u32 classify_task_once(struct task_struct *p)
+{
+    u64 flags = READ_ONCE(p->flags);
+    u32 cls = BOOST_NONE;
+
+    /* Cheapest broad bucket: all workqueue workers */
+    if (flags & PF_WQ_WORKER)
+        cls |= BOOST_WQ;
+
+    log("\tNew task: %s", 2, p->comm);
+
+    /*
+     * For the named kthreads, compare p->comm directly.
+     * This avoids bpf_probe_read_kernel_str() in enqueue().
+     */
+    if (flags & PF_KTHREAD) {
+        if (bpf_strncmp(p->comm, 8, "kworker/") == 0)
+        {
+            //cls |= BOOST_IRQ;
+            log("\tNew task cls is BOOST_IRQ", 2);
+        }
+        else if (bpf_strncmp(p->comm, 10, "ksoftirqd/") == 0)
+        {
+            cls |= BOOST_KSOFTIRQD;
+            log("\tNew task cls is BOOST_KSOFTIRQD", 2);
+        }
+        else if (bpf_strncmp(p->comm, 5, "napi/") == 0)
+        {
+            cls |= BOOST_NAPI;
+            log("\tNew task cls is BOOST_NAPI", 2);
+        }
+    }
+
+    return cls;
+}
+
+static __always_inline bool should_boost_task(struct task_struct *p)
+{
+    u64 flags = READ_ONCE(p->flags);
+
+    // if (flags & PF_KTHREAD)
+    // {
+    //     stat_inc(FCG_STAT_ENQ_KTHREAD);
+    // }
+
+    /*
+     * Fastest possible path for generic kworkers:
+     * no map lookup, no string work.
+     */
+    //if (flags & PF_WQ_WORKER)
+    if (flags & PF_WQ_WORKER)
+    {
+        stat_inc(FCG_STAT_ENQ_WQ_WORKER);
+        return true;
+    }
+
+    /*
+     * Only the named kthread classes need the cached lookup.
+     */
+    if (flags & PF_KTHREAD) {
+        u32 pid = READ_ONCE(p->pid);
+        u32 *cls = bpf_map_lookup_elem(&task_boost_map, &pid);
+
+        if (!cls) return false;
+
+        if (*cls & BOOST_IRQ)
+        {
+            stat_inc(FCG_STAT_ENQ_IRQ);
+        } 
+        else if (*cls & BOOST_KSOFTIRQD)
+        {
+            stat_inc(FCG_STAT_ENQ_KSOFTIRQD);
+        }
+        else if (*cls & BOOST_NAPI)
+        {
+            stat_inc(FCG_STAT_ENQ_NAPI);
+        }
+        else {
+            return false;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+////////////// TODO END REMOVE /////////////////////
+
 void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 {
     struct fcg_task_ctx *taskc;
@@ -1333,14 +1461,22 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
     cgrp = __COMPAT_scx_bpf_task_cgroup(p);
 
-    if (p->flags & PF_KTHREAD) {
-        // Kernel workers must never be starved by RT tasks.
-        log("\tfcg_enqueue: local enqueue for kernel worker with pid %d", 1, p->pid);
+    if (should_boost_task(p)) {
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
+                        enq_flags);//| SCX_ENQ_HEAD);//| SCX_ENQ_PREEMPT);
 
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
         bpf_cgroup_release(cgrp);
         return;
     }
+
+    // if (p->flags & PF_KTHREAD) {
+    //     // Kernel workers must never be starved by RT tasks.
+    //     log("\tfcg_enqueue: local enqueue for kernel worker with pid %d", 1, p->pid);
+
+    //     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_HEAD);
+    //     bpf_cgroup_release(cgrp);
+    //     return;
+    // }
 
     cgc = find_cgrp_ctx(cgrp);
     if (!cgc)
@@ -1380,8 +1516,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             tgt = pick_cpu_to_kick_for_rt(p, /*nr_cpus*/taskc->last_cpu, &is_idle, &can_kick);
 
             log("\tfcg_enqueue: using PICKED CPU %d for pid %d (is idle=%d, can_kick=%d)", cgc->rt_class, tgt, p->pid, is_idle, can_kick);
-
-            stat_inc(FCG_STAT_PNC_AFFINITY);
         }
 
         tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
@@ -1393,18 +1527,18 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         bool is_behind = false;
         if (tgtc)
         {
-            if ( !is_idle && !can_kick )
-            {
-                // Determine if task should be enqueued at head or not
-                u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
-                u64 tv    = p->scx.dsq_vtime;
-                u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
+            // if ( !is_idle && !can_kick )
+            // {
+            //     // Determine if task should be enqueued at head or not
+            //     u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
+            //     u64 tv    = p->scx.dsq_vtime;
+            //     u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
 
-                s64 d = time_delta(now_v, tv);   // signed
-                is_behind = d > (s64)slack_v;
+            //     s64 d = time_delta(now_v, tv);   // signed
+            //     is_behind = d > (s64)slack_v;
 
-                 log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
-            }
+            //      log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
+            // }
 
             cnt_inc(tgtc, tgt, p->pid, true);
         }
@@ -1948,6 +2082,8 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
     if (scx_bpf_dsq_move_to_local(cgid))
     {
+        if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu, %d) SUCCEEDED (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, cpu, &cgv_tree_rt == cgv_tree, enq_count);
+
         if (cpuc)
         {
             cgrp_dispatch_stat( cgid, cgc, cpuc );
@@ -1957,7 +2093,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     {
         cnt_dec_pending(cpuc, cpu, 0, cgid);
 
-        if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu) failed (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, &cgv_tree_rt == cgv_tree, enq_count);
+        if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu, %d) FAILED (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, cpu, &cgv_tree_rt == cgv_tree, enq_count);
 
         if ( enq_count == 0 )
         {
@@ -2011,6 +2147,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         bpf_spin_unlock(&cgv_tree_lock);
         
         bpf_cgroup_release(cgrp);
+        // TODO: Changed to false temporarily to avoid overload
         return true; // Return true so fcg_dispatch loop tries the next node
     }
 
@@ -2108,7 +2245,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         return;
     }
 
-    if ( time_before(now, cpuc->cur_bk_at + cgrp_slice_ns)) {
+    if ( time_before(now, cpuc->cur_bk_at + cgrp_slice_ns) ) {
 
         // Update the non-empty count for RT/BK trees
         cgrp = bpf_cgroup_from_id(cpuc->cur_bk_cgid);
@@ -2127,6 +2264,8 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         
         if (scx_bpf_dsq_move_to_local(cpuc->cur_bk_cgid)) {
             stat_inc(FCG_STAT_CNS_KEEP);
+
+            log("\tfcg_dispatch: scx_bpf_dsq_move_to_local(%llu, %d) SUCCEEDED in KEEP path", cgc->rt_class, cpuc->cur_bk_cgid, cpu);
 
             if ( cgrp )
             {
@@ -2201,17 +2340,21 @@ pick_next_cgroup:
 
         bpf_repeat(CGROUP_MAX_RETRIES) {
             if (try_pick_next_cgroup( &cpuc->cur_bk_cgid, &cgv_tree_bk, cpu, cpuc )) {
-                if (cpuc->cur_bk_cgid)   // non-zero only when we actually moved a DSQ
+                if (cpuc->cur_bk_cgid || cls_get_bk() == 0)   // cur_bk_cgid is non-zero only when we actually moved a DSQ
                 {
                     return;
                 }
+            }
+            else 
+            {
+                return;
             }
         }
     }
     else
     {
-        if ( cpu < NR_CPUS_LOG )
-            log("\t\t\tfcg_dispatch: both trees are empty when called for cpu %d???", 0, cpu);
+        stat_inc(FCG_STAT_CNS_EMPTY);
+        return;
     }
 
     /*
@@ -2233,6 +2376,12 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
 {
     struct fcg_task_ctx *taskc;
     struct fcg_cgrp_ctx *cgc;
+
+    u32 pid = READ_ONCE(p->pid);
+    u32 cls = classify_task_once(p);
+
+    if (cls != BOOST_NONE)
+        bpf_map_update_elem(&task_boost_map, &pid, &cls, BPF_ANY);
 
     /*
     * @p is new. Let's ensure that its task_ctx is available. We can sleep
@@ -2415,6 +2564,9 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
     struct fcg_cgrp_ctx *cgc;
     u64 cgid = 0;
     u8 rt_class = 0;
+
+    u32 pid = READ_ONCE(p->pid);
+    bpf_map_delete_elem(&task_boost_map, &pid);
 
     struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if ( !taskc ) 
