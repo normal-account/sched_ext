@@ -2049,33 +2049,12 @@ void BPF_STRUCT_OPS(fcg_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
     cgc->weight = weight;
     bpf_spin_unlock(&cgv_tree_lock);
 
-        /* *** invalidate cached hweights so refresh actually runs *** */
+    /* *** invalidate cached hweights so refresh actually runs *** */
     __sync_fetch_and_add(&hweight_gen, 1);
 
     /* Optional: refresh now if active so next dispatch uses new hweight */
     if (cgc->nr_active)
         cgrp_refresh_hweight(cgrp, cgc);
-}
-
-inline static bool remove_first_tree_node( struct bpf_rb_root *cgv_tree, struct bpf_rb_node *rb_node, struct bpf_rb_node **removed, struct cgv_node **cgv_node, bool lock_tree )
-{
-    if( NULL == removed || NULL == cgv_node ) return false;
-
-    if ( lock_tree ) bpf_spin_lock(&cgv_tree_lock);
-    
-    struct bpf_rb_node *rb_node2 = bpf_rbtree_first(cgv_tree);
-    if (rb_node2 == rb_node) 
-    {
-        *removed = bpf_rbtree_remove(cgv_tree, rb_node2);
-        if ( *removed )
-        {
-            *cgv_node = container_of(*removed, struct cgv_node, rb_node);
-        }
-    }
-
-    if ( lock_tree ) bpf_spin_unlock(&cgv_tree_lock);
-
-    return *removed != NULL;
 }
 
 inline static void try_stash_node( u64 cgid, struct fcg_cgrp_ctx *cgc, struct bpf_rb_root *cgv_tree, struct cgv_node *cgv_node, s32 cpu )
@@ -2096,8 +2075,9 @@ inline static void try_stash_node( u64 cgid, struct fcg_cgrp_ctx *cgc, struct bp
         u32 qsz  = scx_bpf_dsq_nr_queued( cgid );
 
         if ( ( enq_count > 0 || qsz > 0 ) && 0 == __sync_val_compare_and_swap( &cgc->queued, 0, 1 ) ) // Race condition with fcg_enqueue, we must undo the stash!
+        //if ( qsz > 0 && 0 == __sync_val_compare_and_swap( &cgc->queued, 0, 1 ) ) // Race condition with fcg_enqueue, we must undo the stash!
         {
-            log("\tfcg_dispatch: RACE-CONDITION with enqueue, undoing STASH cgid %llu on cpu %d", cgc->rt_class, cgid, cpu );
+            log("\tfcg_dispatch: RACE-CONDITION with enqueue, undoing STASH cgid %llu on cpu %d (qsz=%u)", cgc->rt_class, cgid, cpu, qsz);
 
             struct cgv_node *back = bpf_kptr_xchg(&stash->node, NULL);
             if ( back )
@@ -2126,12 +2106,18 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
     bpf_spin_lock(&cgv_tree_lock);
 
-    // 1. Peek head under lock, but don't remove
     rb_node = bpf_rbtree_first(cgv_tree);
     if (!rb_node) {
         bpf_spin_unlock(&cgv_tree_lock);
         stat_inc(FCG_STAT_PNC_NO_CGRP);
         if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: no cgroup found (is RT tree %d)", (&cgv_tree_rt == cgv_tree) ? 1 : 0, &cgv_tree_rt == cgv_tree);
+        return true;
+    }
+
+    rb_node = bpf_rbtree_remove(cgv_tree, rb_node);
+    if (!rb_node) {
+        bpf_spin_unlock(&cgv_tree_lock);
+        scx_bpf_error("node could not be removed");
         return true;
     }
 
@@ -2146,50 +2132,38 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     {
         stat_inc(FCG_STAT_PNC_GONE);
         log("\t\ttry_pick_next_cgroup: !cgrp || !cgc (is RT tree %d)", (&cgv_tree_rt == cgv_tree) ? 1 : 0, &cgv_tree_rt == cgv_tree);
+        log("\ttry_pick_next_cgroup: REMOVED cgroup from its tree!", (&cgv_tree_rt == cgv_tree) ? 1 : 0, cgid );
 
-        struct bpf_rb_node *removed = NULL;
-        struct cgv_node *cgv_node2 = NULL;
-        if ( remove_first_tree_node( cgv_tree, rb_node, &removed, &cgv_node2, true ) )
-        {
-            log("\ttry_pick_next_cgroup: REMOVED cgroup from its tree!", (&cgv_tree_rt == cgv_tree) ? 1 : 0, cgid );
-        }
-
-        if ( cgv_node2 ) bpf_obj_drop( cgv_node2 );
+        bpf_obj_drop( cgv_node );
         if (cgrp) bpf_cgroup_release(cgrp);
 
-        return true; // Advanced the tree; try again next tick
+        return true;
     }
 
     struct cpuset_bits *st = bpf_map_lookup_elem(&cpuset_map, &cgid);
     if (!st || !st->init || !fcg_mask_test_cpu(st, (u32)cpu)) 
     {
-        // Head cgroup not allowed on this CPU: rotate head minimally.
         log("\t\ttry_pick_next_cgroup: cgid %llu not allowed on cpu %d (is RT tree %d)",
             (&cgv_tree_rt == cgv_tree) ? 1 : 0, cgid, cpu, &cgv_tree_rt == cgv_tree);
 
         bpf_spin_lock(&cgv_tree_lock);
-
-        // Remove-first under the lock, but only if the head is the one we peeked.
-        struct bpf_rb_node *removed = NULL;
-        struct cgv_node *bumped = NULL;
-
-        remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
-
-        if (removed && bumped) {
-            // Reorder to prevent Head-of-Line blocking because of CPU affinity.
-            bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
-            bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
-        }
-
+        cgv_node->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+        bpf_rbtree_add(cgv_tree, &cgv_node->rb_node, cgv_node_less);
         bpf_spin_unlock(&cgv_tree_lock);
 
+        stat_inc(FCG_STAT_PNC_AFFINITY);
+
         bpf_cgroup_release(cgrp);
-        return true;
+        return false;
     }
 
     enum cpu_runcls cls = cpu_cls(cpu, 0);
     if ( cls == CPU_RT )
     {
+        bpf_spin_lock(&cgv_tree_lock);
+        bpf_rbtree_add(cgv_tree, &cgv_node->rb_node, cgv_node_less);
+        bpf_spin_unlock(&cgv_tree_lock);
+
         bpf_cgroup_release(cgrp);
         return true;
     }
@@ -2200,6 +2174,11 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     if ( cls == CPU_RT )
     {
         cnt_dec_pending(cpuc, cpu, 0, cgid);
+
+        bpf_spin_lock(&cgv_tree_lock);
+        bpf_rbtree_add(cgv_tree, &cgv_node->rb_node, cgv_node_less);
+        bpf_spin_unlock(&cgv_tree_lock);
+
         bpf_cgroup_release(cgrp);
         return true;
     }
@@ -2227,20 +2206,11 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
             stat_inc(FCG_STAT_PNC_EMPTY);
 
             log("\tfcg_dispatch: TRUE EMPTY for cgid %llu on cpu %d", cgc->rt_class, cgid, cpu );
-
-            struct bpf_rb_node *removed = NULL;
-            struct cgv_node *cgv_node2 = NULL;
-            remove_first_tree_node( cgv_tree, rb_node, &removed, &cgv_node2, true );
-
-            if ( removed && cgv_node2 )
-            {
-                log("\ttry_pick_next_cgroup: REMOVED cgid %llu (cvtime=%llu) from its tree!", cgc->rt_class, cgid, cgv_node2->cvtime );
-                try_stash_node( cgid, cgc, cgv_tree, cgv_node2, cpu );
-            }
+            try_stash_node( cgid, cgc, cgv_tree, cgv_node, cpu );
 
             bpf_cgroup_release(cgrp);
 
-            return true;
+            return false;
         }
 
 
@@ -2251,25 +2221,9 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         char cg_name_buf[32];
         bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp->kn->name);
 
-        //log("\t\ttry_pick_next_cgroup: task affinity blocked cgid %llu (%s) on cpu %d - rotating", cgc->rt_class, cgid, cg_name_buf, cpu);
-
         bpf_spin_lock(&cgv_tree_lock);
-
-        struct bpf_rb_node *removed = NULL;
-        struct cgv_node *bumped = NULL;
-
-        // Remove the node we peeked
-        remove_first_tree_node(cgv_tree, rb_node, &removed, &bumped, /*lock_tree=*/false);
-
-        if (removed && bumped) {
-            /* 
-             * Charging a slice delta to rotate it to the back 
-             * so we can get to the next cgroup.
-             */
-            bumped->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
-            bpf_rbtree_add(cgv_tree, &bumped->rb_node, cgv_node_less);
-        }
-
+        cgv_node->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+        bpf_rbtree_add(cgv_tree, &cgv_node->rb_node, cgv_node_less);
         bpf_spin_unlock(&cgv_tree_lock);
         
         bpf_cgroup_release(cgrp);
@@ -2283,64 +2237,37 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
     */
     cgrp_refresh_hweight(cgrp, cgc);
 
-    log("\tfcg_dispatch: calling remove_first_tree_node for cgid %llu!!!", 0, cgid );
+    log("\tfcg_dispatch: charging cvtime for cgid %llu!!!", 0, cgid );
 
-    // 2. Attempt to remove the node from the tree if it was successfully moved
     bpf_spin_lock(&cgv_tree_lock);
 
-    struct bpf_rb_node *removed = NULL;
-    struct cgv_node *cgv_node2 = NULL;
-    struct bpf_rb_node *rb_node2 = bpf_rbtree_first(cgv_tree);
+    if (time_before(cvtime_now, cgv_node->cvtime))
+        cvtime_now = cgv_node->cvtime;
 
-    if ( rb_node2 && remove_first_tree_node( cgv_tree, rb_node, &removed, &cgv_node2, false ) )
-    {
-        // Advance cvtime_now if needed before charging
-        if (time_before(cvtime_now, cgv_node2->cvtime))
-            cvtime_now = cgv_node2->cvtime;
+    /*
+    * Charge the full slice upfront and exact later according to
+    * actual consumption. Prevents lowpri thundering herd.
+    */
+    cgv_node->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+    cgrp_cap_budget(cgv_node, cgc); 
 
-        /*
-        * Note that here we charge the full slice upfront and then exact later
-        * according to the actual consumption. This prevents lowpri thundering
-        * herd from saturating the machine.
-        */
-        cgv_node2->cvtime += cgrp_slice_ns * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
-        cgrp_cap_budget(cgv_node2, cgc); 
-        
-        bpf_rbtree_add(cgv_tree, &cgv_node2->rb_node, cgv_node_less);
-    
-        u64 cvtime = cgv_node2->cvtime;
+    u64 cvtime = cgv_node->cvtime;
 
-        bpf_spin_unlock(&cgv_tree_lock);
-
-        // TODO: REMOVE THIS
-        if ( cvtime > 3000000000000000000ULL )
-        {
-            scx_bpf_error( "CVTIME OVERFLOW!");
-        }
-
-        log("\ttry_pick_next_cgroup: REMOVED and ADDED cgid %llu (cvtime=%llu) back to its tree!", cgc->rt_class, cgid, cvtime );
-    
-        *cgidp = cgid;
-        stat_inc(FCG_STAT_PNC_NEXT);
-    
-        log("\tfcg_dispatch: try_pick_next_cgroup picked new cgroup %llu! for cpu %d (tree sizes rt=%u bk=%u)", cgc->rt_class, cgid, cpu, cls_get_rt(), cls_get_bk());
-        
-        bpf_cgroup_release(cgrp);
-
-        return true;
-    }
+    bpf_rbtree_add(cgv_tree, &cgv_node->rb_node, cgv_node_less);
 
     bpf_spin_unlock(&cgv_tree_lock);
 
-    log("\tfcg_dispatch: try_pick_next_cgroup picked new cgroup %llu for cpu %d, but came back to an empty head...", cgc->rt_class, cgid, cpu );
+    // TODO: REMOVE THIS
+    if ( cvtime > 3000000000000000000ULL )
+    {
+        scx_bpf_error( "CVTIME OVERFLOW!");
+    }
 
-    /* We couldn't get a hold of the cvg_node, so we can't charge the full slice directly.
-    *  We can compensate by adding a full slice to the cvtime_delta instead.
-    */
-    __u64 delta = (cgrp_slice_ns * FCG_HWEIGHT_ONE) / (cgc->hweight ?: 1);
-    __sync_fetch_and_add(&cgc->cvtime_delta, delta);
+    *cgidp = cgid;
+    stat_inc(FCG_STAT_PNC_NEXT);
 
-    *cgidp = cgid; // We did consume; advertise selection
+    log("\tfcg_dispatch: try_pick_next_cgroup picked new cgroup %llu! for cpu %d (tree sizes rt=%u bk=%u)", cgc->rt_class, cgid, cpu, cls_get_rt(), cls_get_bk());
+    
     bpf_cgroup_release(cgrp);
 
     return true;
@@ -2436,22 +2363,22 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
         goto pick_next_cgroup;
     }
 
-    // cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
-    // if (cgc && cpuc->cur_bk_at > 0) {
-    //     // TODO: Is this a bug? Why are we charging extra debt if a task finishes early???v
-	// 	/*
-	// 	 * We want to update the vtime delta and then look for the next
-	// 	 * cgroup to execute but the latter needs to be done in a loop
-	// 	 * and we can't keep the lock held. Oh well...
-	// 	 */
-	// 	bpf_spin_lock(&cgv_tree_lock);
-	// 	__sync_fetch_and_add(&cgc->cvtime_delta,
-	// 			     (cpuc->cur_bk_at + cgrp_slice_ns - now) *
-	// 			     FCG_HWEIGHT_ONE / (cgc->hweight ?: 1));
-	// 	bpf_spin_unlock(&cgv_tree_lock);
-    // } else {
-    //     stat_inc(FCG_STAT_CNS_GONE);
-    // }
+    cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+    if (cgc) {
+        // TODO: Is this a bug? Why are we charging extra debt if a task finishes early???
+		/*
+		 * We want to update the vtime delta and then look for the next
+		 * cgroup to execute but the latter needs to be done in a loop
+		 * and we can't keep the lock held. Oh well...
+		 */
+		bpf_spin_lock(&cgv_tree_lock);
+		__sync_fetch_and_add(&cgc->cvtime_delta,
+				     (cpuc->cur_bk_at + cgrp_slice_ns - now) *
+				     FCG_HWEIGHT_ONE / (cgc->hweight ?: 1));
+		bpf_spin_unlock(&cgv_tree_lock);
+    } else {
+        stat_inc(FCG_STAT_CNS_GONE);
+    }
 
     bpf_cgroup_release( cgrp );
 
@@ -2466,15 +2393,12 @@ pick_next_cgroup:
 
         bpf_repeat(CGROUP_MAX_RETRIES) {
             if (try_pick_next_cgroup( &cpuc->cur_bk_cgid, &cgv_tree_bk, cpu, cpuc )) {
-                if (cpuc->cur_bk_cgid || cls_get_bk() == 0)   // cur_bk_cgid is non-zero only when we actually moved a DSQ
-                {
-                    return;
-                }
-            }
-            else 
-            {
                 return;
             }
+            // else 
+            // {
+            //     return;
+            // }
         }
     }
     else

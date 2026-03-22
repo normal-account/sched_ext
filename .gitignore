@@ -9,3 +9,5 @@ bad*
 vmlinux.h
 linux-*
 bench.md
+scx_flatcg.bpf.c
+scx_flatcg.h
