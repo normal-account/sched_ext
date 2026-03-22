@@ -6,7 +6,7 @@
 */
 enum {
     FALLBACK_DSQ		= 0,
-    CGROUP_MAX_RETRIES	= 8,
+    CGROUP_MAX_RETRIES	= 1024,
 };
 
 char _license[] SEC("license") = "GPL";
@@ -1693,6 +1693,19 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     }
     else
     {
+
+        const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
+        bool affinity_restricted = p->nr_cpus_allowed != nr_cpus;
+
+        if (affinity_restricted) {
+            bool is_idle = false;
+            //s32 tgt = scx_bpf_select_cpu_dfl(p, bpf_get_smp_processor_id(), 0, &is_idle);
+
+            scx_bpf_dsq_insert(p, tgt | SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+
+            goto out_release;
+        }
+        
         u64 tvtime = p->scx.dsq_vtime;
 
         /*
