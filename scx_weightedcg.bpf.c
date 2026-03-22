@@ -93,6 +93,7 @@ struct {
 } cgv_node_stash SEC(".maps");
 
 struct fcg_task_ctx {
+    u64		bypassed_at;    // when the task bypassed the regular scheduling path
     u64     enq_cgid;       // cgroup we credited enq_count to
     
     u32     sel_cls;
@@ -1340,6 +1341,17 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
     return cpu;
 }
 
+static void set_bypassed_at(struct task_struct *p, struct fcg_task_ctx *taskc)
+{
+	/*
+	 * Tell fcg_stopping() that this bypassed the regular scheduling path
+	 * and should be force charged to the cgroup. 0 is used to indicate that
+	 * the task isn't bypassing, so if the current runtime is 0, go back by
+	 * one nanosecond.
+	 */
+	taskc->bypassed_at = p->se.sum_exec_runtime ?: (u64)-1;
+}
+
 s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
     bool is_idle = false;
@@ -1694,15 +1706,26 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     else
     {
 
-        const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
-        bool affinity_restricted = p->nr_cpus_allowed != nr_cpus;
-
-        if (affinity_restricted) {
-            bool is_idle = false;
-            //s32 tgt = scx_bpf_select_cpu_dfl(p, bpf_get_smp_processor_id(), 0, &is_idle);
-
-            scx_bpf_dsq_insert(p, tgt | SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
-
+        if (p->nr_cpus_allowed != nr_cpus) {
+            set_bypassed_at(p, taskc);
+    
+            /*
+             * The global dq is deprioritized as we don't want to let tasks
+             * to boost themselves by constraining its cpumask. The
+             * deprioritization is rather severe, so let's not apply that to
+             * per-cpu kernel threads. This is ham-fisted. We probably wanna
+             * implement per-cgroup fallback dq's instead so that we have
+             * more control over when tasks with custom cpumask get issued.
+             */
+            if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
+                stat_inc(FCG_STAT_LOCAL);
+                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
+                           enq_flags);
+            } else {
+                stat_inc(FCG_STAT_GLOBAL);
+                scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL,
+                           enq_flags);
+            }
             goto out_release;
         }
         
@@ -1949,8 +1972,6 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
 
     u64 cgid = cgrp ? cgrp->kn->id : 0;
 
-    bpf_cgroup_release(cgrp);
-
     rt_class = cgc && cgc->rt_class;
 
     if ( cpuc && cgc && cgc->rt_class )
@@ -1960,6 +1981,15 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
         if (time_before(cur, v))
             __sync_val_compare_and_swap(&cpuc->rt_vtime_now, cur, v);
     }
+
+	if (cgc && taskc->bypassed_at)
+    {
+		__sync_fetch_and_add(&cgc->cvtime_delta,
+				     p->se.sum_exec_runtime - taskc->bypassed_at);
+		taskc->bypassed_at = 0;
+	}
+
+	bpf_cgroup_release(cgrp);
 
 log_and_out:
 /* Clear per-CPU current cgid only on sleep so select_cpu can consider this CPU again */
@@ -2398,6 +2428,11 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 pick_next_cgroup:
     cpuc->cur_bk_at = now;
     cpuc->cur_bk_cgid = 0;
+
+	if (scx_bpf_dsq_move_to_local(FALLBACK_DSQ)) {
+		return;
+	}
+
 
     if ( cls_get_bk() != 0 )
     {
