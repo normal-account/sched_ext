@@ -16,6 +16,7 @@ const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
 
 const u32 NR_CPUS_LOG = 96;
+const u64 BK_ACTIVE_SLICE_NS = 2000000ULL;
 
 u64 cvtime_now;
 
@@ -48,6 +49,7 @@ struct fcg_cpu_ctx {
     u64 rt_vtime_now;   // min-vtime base for RT tasks on this CPU
 
     u32 rt_claim_pid;  // 0 = free, else pid that reserved this cpu for RT
+    u32 rt_active;     // 1 once an RT task has been assigned to this CPU
 
 #if FCG_DEBUG
     u64  first_move_ts;         // when we successfully moved that DSQ to local
@@ -227,7 +229,10 @@ static __always_inline void decrement_enq_count( struct fcg_task_ctx *taskc, str
 static __always_inline void cnt_inc(struct fcg_cpu_ctx *cpuc, u32 cpu, s32 pid, bool is_rt)
 {
     if (!cpuc) return;
-    if (is_rt) __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+    if (is_rt) {
+        __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+        cpuc->rt_active = 1;
+    }
     else       __sync_fetch_and_add(&cpuc->bk_cnt, 1);
 }
 
@@ -1429,7 +1434,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 			{
 				set_bypassed_at(p, taskc);
 				stat_inc(FCG_STAT_LOCAL);
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, 0);
 			}
 			else
 			{
@@ -1775,7 +1780,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             {
                 stat_inc(FCG_STAT_GLOBAL);
                 scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL,
-                           enq_flags);
+                           enq_flags); 
             }
             goto out_release;
         }
@@ -1796,7 +1801,9 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         cgrp_enqueued(cgrp, cgc);
 
-        scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
+        tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
+
+        scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, tgtc && tgtc->rt_active ? BK_ACTIVE_SLICE_NS : task_slice_ns, tvtime, enq_flags);
 
         // TODO: REMOVE
         //fcg_dump_cgroup_tasks(p->pid, cgid, p->scx.dsq_vtime);
@@ -1972,6 +1979,8 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         else
         {
             cgrp_running_stat( cgid, cgc, cpuc );
+            if ( cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
+                p->scx.slice = BK_ACTIVE_SLICE_NS;
         }
 
         // Decrement the enq_count if applicable and set the enq cgid to 0
@@ -2385,22 +2394,29 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
     enum cpu_runcls cls = cpu_cls(cpu, 0);
     if ( cls == CPU_RT )
     {
-        stat_inc(FCG_STAT_CNS_GONE); // TODO: Remove this or create a dedicated stat
+        stat_inc(FCG_STAT_CNS_GONE);
 
         log("\tfcg_dispatch: CANCELLED on CPU %d as it is running RT (last BK %llu at %llu)", 0, cpu, cpuc->cur_bk_cgid, cpuc->cur_bk_at);
         return;
     }
 
+    /*
+     * RT-active fast path: skip the heavy "keep cgroup" and cvtime debt
+     * paths that take cgv_tree_lock. Just reset and go straight to a
+     * single-shot BK dispatch attempt.
+     */
+    if ( cpuc->rt_active )
+        goto pick_next_cgroup;
+
     if ( time_before(now, cpuc->cur_bk_at + cgrp_slice_ns) ) {
 
-        // Update the non-empty count for RT/BK trees
         cgrp = bpf_cgroup_from_id(cpuc->cur_bk_cgid);
         if (cgrp) {
             cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
         }
 
         /* If current is BK and *any* RT is pending, try RT first. */
-        if ( cgrp && cgc && cgc->rt_class == 0 /*&& cls_get_rt() > 0*/ ) 
+        if ( cgrp && cgc && cgc->rt_class == 0 ) 
         {
             log("\tfcg_dispatch: Should we stay on same CPU %d for cgroup %llu with rt=%llu", 0, cpu, cpuc->cur_bk_cgid, cls_get_rt());
 
@@ -2458,12 +2474,6 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 
     cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
     if (cgc) {
-        // TODO: Is this a bug? Why are we charging extra debt if a task finishes early???
-		/*
-		 * We want to update the vtime delta and then look for the next
-		 * cgroup to execute but the latter needs to be done in a loop
-		 * and we can't keep the lock held. Oh well...
-		 */
 		bpf_spin_lock(&cgv_tree_lock);
 		__sync_fetch_and_add(&cgc->cvtime_delta,
 				     (cpuc->cur_bk_at + cgrp_slice_ns - now) *
@@ -2503,14 +2513,11 @@ pick_next_cgroup:
         if ( cpu < NR_CPUS_LOG )
             log("\tfcg_dispatch: pick_next_cgroup trying to move BK to local (size %u) on cpu %d", 0, cls_get_bk(), cpu);
 
-        bpf_repeat(CGROUP_MAX_RETRIES) {
+        u32 max_retries = cpuc->rt_active ? 2 : CGROUP_MAX_RETRIES;
+        bpf_repeat(max_retries) {
             if (try_pick_next_cgroup( &cpuc->cur_bk_cgid, &cgv_tree_bk, cpu, cpuc )) {
                 return;
             }
-            // else 
-            // {
-            //     return;
-            // }
         }
     }
     else
