@@ -16,7 +16,7 @@ const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
 
 const u32 NR_CPUS_LOG = 96;
-const u64 BK_ACTIVE_SLICE_NS = 2000000ULL;
+const u64 BK_ACTIVE_SLICE_NS = 2000ULL;
 
 u64 cvtime_now;
 
@@ -1379,6 +1379,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
         log("\tfcg_select_cpu: setting SEL CPU %d for pid %d (cls=%u)", 2, taskc->sel_cpu, p->pid, (u32)taskc->sel_cls);
 
         //if ( taskc->sel_cls == CPU_IDLING )
+        //if( false )
         {
             s32 tgt = taskc->sel_cpu;
             u64 cgid = cgrp->kn->id;
@@ -1387,13 +1388,30 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
             task_enqueue_stat(p, taskc, cgid, is_idle, can_kick);
             taskc->sel_cpu = nr_cpus;
 
+            bool is_behind = false;
             struct fcg_cpu_ctx *tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
             if (tgtc)
-                cnt_inc(tgtc, tgt, p->pid, true);
-
-            u64 rt_flags = SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD;
-            if ( is_idle || can_kick ) rt_flags |= SCX_ENQ_PREEMPT;
+            {
+                #if RT_VTIME
+                if ( !is_idle && !can_kick )
+                {
+                    // Determine if task should be enqueued at head or not
+                    u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
+                    u64 tv    = p->scx.dsq_vtime;
+                    u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
     
+                    s64 d = time_delta(now_v, tv);   // signed
+                    is_behind = d > 0;//(s64)slack_v;
+    
+                     log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
+                }
+                #endif
+                
+                cnt_inc(tgtc, tgt, p->pid, true);
+            }
+
+            u64 rt_flags = SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD;
+            if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD |SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
 
@@ -1402,7 +1420,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
             if ( is_idle )
                 scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-           else if ( can_kick )
+           else if ( can_kick || is_behind)
                 scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
 
 
@@ -1720,24 +1738,26 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         bool is_behind = false;
         if (tgtc)
         {
-            // if ( !is_idle && !can_kick )
-            // {
-            //     // Determine if task should be enqueued at head or not
-            //     u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
-            //     u64 tv    = p->scx.dsq_vtime;
-            //     u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
+            #if RT_VTIME
+            if ( !is_idle && !can_kick )
+            {
+                // Determine if task should be enqueued at head or not
+                u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
+                u64 tv    = p->scx.dsq_vtime;
+                u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
 
-            //     s64 d = time_delta(now_v, tv);   // signed
-            //     is_behind = d > (s64)slack_v;
+                s64 d = time_delta(now_v, tv);   // signed
+                is_behind = d > 0;//(s64)slack_v;
 
-            //      log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
-            // }
+                 log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
+            }
+            #endif
 
             cnt_inc(tgtc, tgt, p->pid, true);
         }
         
         // Task direct enqueue 
-        u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
+        u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
 
         if ( is_idle || can_kick || is_behind ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
@@ -1772,7 +1792,9 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
              * implement per-cgroup fallback dq's instead so that we have
              * more control over when tasks with custom cpumask get issued.
              */
+            //
             if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
+            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
                 stat_inc(FCG_STAT_LOCAL);
                 scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
                            enq_flags);
