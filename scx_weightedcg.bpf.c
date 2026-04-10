@@ -16,8 +16,9 @@ const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
 
 const u32 NR_CPUS_LOG = 96;
-const u64 BK_ACTIVE_SLICE_NS = 2000ULL;
-
+#if RT_ACTIVE_CHECK
+const u64 BK_ACTIVE_SLICE_NS = 20000ULL;
+#endif
 u64 cvtime_now;
 
 UEI_DEFINE(uei);
@@ -1439,7 +1440,8 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
 	s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     
-	if (is_idle) {
+	//if (is_idle) {
+    if (is_idle && p->nr_cpus_allowed != nr_cpus) {
 		struct fcg_cpu_ctx *cpuc = find_cpu_ctx(cpu);
 		enum cpu_runcls cls = cpu_cls(cpu, 0);
 
@@ -1452,8 +1454,13 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 			{
 				set_bypassed_at(p, taskc);
 				stat_inc(FCG_STAT_LOCAL);
+                #if RT_ACTIVE_CHECK
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, 0);
-			}
+                #else
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+                #endif
+
+            }
 			else
 			{
 				cnt_dec_pending(cpuc, cpu, 0, 0);
@@ -1784,6 +1791,9 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         if (p->nr_cpus_allowed != nr_cpus) {
             set_bypassed_at(p, taskc);
     
+            u32 cpu = bpf_get_smp_processor_id();
+            struct fcg_cpu_ctx *cpuc = find_cpu_ctx(cpu);
+
             /*
              * The global dq is deprioritized as we don't want to let tasks
              * to boost themselves by constraining its cpumask. The
@@ -1795,14 +1805,22 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             //
             if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
             //if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
+            //if (false) {
                 stat_inc(FCG_STAT_LOCAL);
-                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
-                           enq_flags);
+                #if RT_ACTIVE_CHECK
+                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, enq_flags);
+                #else 
+                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+                #endif
+            
             } else
             {
                 stat_inc(FCG_STAT_GLOBAL);
-                scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL,
-                           enq_flags); 
+                #if RT_ACTIVE_CHECK
+                scx_bpf_dsq_insert(p, FALLBACK_DSQ, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, enq_flags);
+                #else
+                scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL, enq_flags);
+                #endif
             }
             goto out_release;
         }
@@ -1825,8 +1843,11 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
 
+        #if RT_ACTIVE_CHECK
         scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, tgtc && tgtc->rt_active ? BK_ACTIVE_SLICE_NS : task_slice_ns, tvtime, enq_flags);
-
+        #else
+        scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
+        #endif
         // TODO: REMOVE
         //fcg_dump_cgroup_tasks(p->pid, cgid, p->scx.dsq_vtime);
     }
@@ -2001,8 +2022,10 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         else
         {
             cgrp_running_stat( cgid, cgc, cpuc );
-            if ( cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
+            #if RT_ACTIVE_CHECK
+            if ( cgc->weight < 100 && cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
                 p->scx.slice = BK_ACTIVE_SLICE_NS;
+            #endif
         }
 
         // Decrement the enq_count if applicable and set the enq cgid to 0
@@ -2659,7 +2682,7 @@ int BPF_STRUCT_OPS_SLEEPABLE(fcg_cgroup_init, struct cgroup *cgrp,
     cgv_node->cgid = cgid;
     cgv_node->cvtime = cvtime_now;
 
-    log("\tfcg_cgroup_init: setting the stash to NON-NULL for cgroup %llu!!!", cgid);
+    log("\tfcg_cgroup_init: setting the stash to NON-NULL for cgroup %llu (weight=%llu)!!!", cgc->rt_class, cgid, args->weight);
 
     cgv_node = bpf_kptr_xchg(&stash->node, cgv_node);
     if (cgv_node) {

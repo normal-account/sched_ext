@@ -106,8 +106,16 @@ struct fcg_cgrp_stats {
 #define FCG_BUDDIES 0
 #endif
 
+#ifndef RT_VTIME
+#define RT_VTIME 0
+#endif
+
+#ifndef RT_ACTIVE_CHECK
+#define RT_ACTIVE_CHECK 1
+#endif
+
 #if FCG_DEBUG
-#define log(fmt, rt_class, ...) if ( rt_class == 2 ) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( true || rt_class == 2 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
 #endif
