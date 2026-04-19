@@ -107,13 +107,19 @@ struct fcg_task_ctx {
 
     u32     last_cpu;       // where it last ran
 
+    u64     cur_cgid;
+
 #if FCG_DEBUG
     u64 run_start_exec_ns;
 
     u64 first_enq_ts;     // armed timestamp for enqueue->dispatch latency
     u8  rt_enq_bucket;
 #endif
+
+    u8      rt_class;       // 1=RT, 0=BK
 };
+
+
 
 struct cls_counters {
     u64 rt;   // # RT cgroups with non-empty DSQ
@@ -704,6 +710,177 @@ struct {
     __type(key, int);
     __type(value, struct fcg_task_ctx);
 } task_ctx SEC(".maps");
+
+
+
+
+// USER RINGBUF UTILS START
+
+struct pg_wait_event {
+    uint64_t lock;
+    int32_t pid;
+	int32_t owner_pid;
+    uint32_t event_info;
+    uint8_t is_start;
+    uint8_t is_acquire_event;
+    uint8_t type;
+    uint8_t _pad; // padding for alignment...
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_USER_RINGBUF);
+    __uint(max_entries, 1 << 20); // roughly 1 mb
+} postgres_rb SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} pg_rb_last_drain_ns SEC(".maps");
+
+#define FCG_MAX_PI_EVENTS 4
+#define PI_SCAN_MAX 256
+
+/* Global array: holds multiple cgids of preempted lock-holders */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, FCG_MAX_PI_EVENTS);
+    __type(key, u32);
+    __type(value, u32); // cgid
+} global_pi_board SEC(".maps");
+
+static long pg_rb_cb(const struct bpf_dynptr *dynptr, void *ctx)
+{
+    stat_inc(FCG_STAT_BPF_MSG);
+
+    struct pg_wait_event ev = {};
+    long ret;
+
+    ret = bpf_dynptr_read(&ev, sizeof(ev), dynptr, 0, 0);
+    if (ret)
+    {
+        log("pg_rb_cb: ignoring malformed sample", 2);
+        return 0;
+    }
+
+
+    if (ev.is_acquire_event)
+    {
+        log("pg_rb_cb: %s pid=%d lock=0x%x success=%u", 2, ev.is_start ? "ACQUIRE" : "RELEASE", ev.pid, ev.lock, ev.type);
+        return 0;
+    }
+
+
+    if (ev.is_start)
+    {
+        log("\tpg_rb_cb: WAIT START %s pid=%d owner pid=%d type=%u lock=0x%x", 2, ev.event_info == 0x01000000U ? "LWLOCK" : "SPINLOCK", ev.pid, ev.owner_pid, ev.type, ev.lock);
+    }
+    else{
+        log("\tpg_rb_cb: WAIT END %s pid=%d type=%u", 2, ev.event_info == 0x01000000U ? "LWLOCK" : "SPINLOCK", ev.pid, ev.type);
+    }
+
+
+    // --- PRIORITY INHERITANCE LOGIC ---
+    if (!ev.is_acquire_event && ev.is_start && ev.owner_pid > 0 && ev.pid > 0) {
+        struct task_struct *waiter = bpf_task_from_pid(ev.pid);
+        struct task_struct *owner = bpf_task_from_pid(ev.owner_pid);
+
+        if (waiter && owner) {
+            struct fcg_task_ctx *w_ctx = bpf_task_storage_get(&task_ctx, waiter, 0, 0);
+            struct fcg_task_ctx *o_ctx = bpf_task_storage_get(&task_ctx, owner, 0, 0);
+
+            // 1. Is an HW task waiting on a BK task?
+            if (w_ctx && 1 == w_ctx->rt_class && o_ctx && 0 == o_ctx->rt_class) 
+            {
+                stat_inc(FCG_STAT_BPF_CONFLICT);
+
+                bool duplicate = false;
+                int empty_slot = -1;
+
+                // Pass 1: Check for duplicates and find the first empty slot
+                #pragma clang loop unroll(full)
+                for (u32 i = 0; i < FCG_MAX_PI_EVENTS; i++) {
+                    u32 key = (ev.owner_pid + i) % FCG_MAX_PI_EVENTS;
+                    u32 *slot = bpf_map_lookup_elem(&global_pi_board, &key);
+                    if (slot) {
+                        if (*slot == ev.owner_pid) {
+                            duplicate = true;
+                        } else if (*slot == 0 && empty_slot == -1) {
+                            empty_slot = key;
+                        }
+                    }
+                }
+
+                // Pass 2: Insert if no duplicate exists
+                if (!duplicate && empty_slot != -1) {
+                    u32 key = empty_slot;
+                    u32 *slot = bpf_map_lookup_elem(&global_pi_board, &key);
+                    
+                    if (slot && __sync_val_compare_and_swap(slot, 0, ev.owner_pid) == 0) {
+                        if (o_ctx->last_cpu < nr_cpus)
+                        {
+                            scx_bpf_kick_cpu(o_ctx->last_cpu, SCX_KICK_PREEMPT);
+                            log("\tpg_rb_cb: PI BYPASS REQUESTED: pid %u added to board (type=%d). Hint CPU: %d", 2, ev.owner_pid, ev.type, o_ctx->last_cpu);
+                        }
+                        else 
+                        {
+                            log("\tpg_rb_cb: PI BYPASS REQUESTED WITHOUT HINT!", 2);
+                        }
+                    }
+                } else if (!duplicate && empty_slot == -1) {
+                    log("\tpg_rb_cb: PI BYPASS DROPPED: Board is full!", 2);
+                }
+            }
+            else 
+            {
+                log("\tpg_rb_cb: NOT GOING THROUGH BYPASS (owner=%x with rt=%u, waiter=%x with rt=%u)!", 2, o_ctx, o_ctx && o_ctx->rt_class, w_ctx, w_ctx && w_ctx->rt_class);
+            }
+        }
+        else 
+        {
+            log("\tpg_rb_cb: CANNOT FIND TASK CONTEXT FOR OWNER (%x) OR WAITER (%x)!", 2, owner, waiter);
+        }
+
+        release:
+        // Always release references from bpf_task_from_pid
+        if (owner) bpf_task_release(owner);
+        if (waiter) bpf_task_release(waiter);
+    }
+
+    return 0;
+}
+
+static __always_inline void pg_rb_try_drain(void)
+{
+    u32 k = 0;
+    u64 now = bpf_ktime_get_ns();
+    u64 *lastp = bpf_map_lookup_elem(&pg_rb_last_drain_ns, &k);
+    if (!lastp)
+        return;
+
+    u64 old = __sync_fetch_and_add(lastp, 0);
+
+    if (now - old < 1000000ULL)
+        return;
+
+    // Only one CPU gets to advance last -> now
+    if (__sync_val_compare_and_swap(lastp, old, now) != old)
+        return;
+
+    long drained = bpf_user_ringbuf_drain(&postgres_rb, pg_rb_cb, NULL,
+                                         BPF_RB_NO_WAKEUP);
+
+    stat_inc(FCG_STAT_BPF_DRAIN);
+
+    if (drained < 0) {
+        //scx_bpf_error("pg ringbuf drain failed: %ld", drained);
+
+        stat_inc(FCG_STAT_BPF_DRAIN_FAIL);
+    }
+}
+
+// USER RINGBUF UTILS END
 
 // Gets inc'd on weight tree changes to expire the cached hweights
 u64 hweight_gen = 1;
@@ -1788,7 +1965,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
     else
     {
 
-        if (p->nr_cpus_allowed != nr_cpus) {
+        if (false && p->nr_cpus_allowed != nr_cpus) {
             set_bypassed_at(p, taskc);
     
             u32 cpu = bpf_get_smp_processor_id();
@@ -2433,6 +2610,118 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
     if (!cpuc)
         return;
 
+    pg_rb_try_drain();
+
+    // --- MULTI-LOCK PRIORITY INVERSION BYPASS ---
+
+    if ( cpu == 0 ) // TEMPORARY: REMOVE
+    {
+    #pragma clang loop unroll(full)
+    for (u32 i = 0; i < FCG_MAX_PI_EVENTS; i++) {
+        u32 key = i;
+        u32 *slot = bpf_map_lookup_elem(&global_pi_board, &key);
+        
+        if (slot && *slot != 0) {
+            bool pulled = false;
+            
+            u32 pid_to_pull = *slot;
+
+            log("\tfcg_dispatch bypass: found slot for pid %u on cpu %d", 2, pid_to_pull, cpu);
+
+            struct task_struct *owner_task = bpf_task_from_pid(pid_to_pull);
+            if(!owner_task)
+            {
+                log("\tfcg_dispatch bypass: cancelling because of dead task pointer for pid %u on cpu %d", 2, pid_to_pull, cpu);
+
+                __sync_val_compare_and_swap(slot, pid_to_pull, 0);
+                continue;
+            } 
+
+            const struct cpumask *allowed = (const struct cpumask *)owner_task->cpus_ptr;
+            if (!bpf_cpumask_test_cpu((s32)cpu, allowed)) {
+
+                log("\tfcg_dispatch bypass: cancelling because cpuset for pid %u on cpu %d", 2, pid_to_pull, cpu);
+
+                bpf_task_release(owner_task);
+                continue;
+            }
+
+            struct fcg_task_ctx *o_ctx = bpf_task_storage_get(&task_ctx, owner_task, 0, 0);
+            if (!o_ctx) {
+
+                log("\tfcg_dispatch bypass: cancelling because of NULL ctx for pid %u on cpu %d", 2, pid_to_pull, cpu);
+
+                bpf_task_release(owner_task);
+                continue;
+            }
+
+            u64 cgid_to_pull = o_ctx->cur_cgid;
+
+            char cg_name_buf[32];
+            struct cgroup *cgrp = bpf_cgroup_from_id(cgid_to_pull);
+            bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp && cgrp->kn ? cgrp->kn->name : NULL);
+            log("\tfcg_dispatch bypass: cg_name_buf for pid %u on cpu %d: %s", 2, pid_to_pull, cpu, cg_name_buf);
+            if (cgrp) bpf_cgroup_release(cgrp);
+
+            // AFFINITY CHECK
+            struct cpuset_bits *st = bpf_map_lookup_elem(&cpuset_map, &cgid_to_pull);
+            if (true ||st && st->init && fcg_mask_test_cpu(st, (u32)cpu)) { // TODO: Fix affinity check
+                struct bpf_iter_scx_dsq it;
+                struct task_struct *p;
+                
+                // Open the DSQ Iterator for the specific cgroup
+                bpf_iter_scx_dsq_new(&it, cgid_to_pull, 0);
+                
+                int steps = 0;
+                while ((p = bpf_iter_scx_dsq_next(&it))) {
+                    
+                    if (++steps > PI_SCAN_MAX)
+                        break;
+
+                    if (p->pid == pid_to_pull) {
+                        // Target acquired: Yank it to our local DSQ
+                        // Note: Named scx_bpf_dispatch_from_dsq() on kernel 6.12
+                        if ( scx_bpf_dsq_move(&it, p, SCX_DSQ_LOCAL, SCX_ENQ_PREEMPT) )
+                        {
+                            // CLAIM IT: Atomically clear the slot
+                            __sync_val_compare_and_swap(slot, pid_to_pull, 0);
+                            
+                            cnt_inc_pending(cpuc, cpu);
+                            cpuc->cur_bk_cgid = cgid_to_pull;
+                            cpuc->cur_bk_at = now;
+                            pulled = true;
+
+                            stat_inc(FCG_STAT_BPF_BOOST);
+
+                            log("\tfcg_dispatch bypass: successfully BOOSTED pid %u on cpu %d", 2, pid_to_pull, cpu);
+
+                            break;                            
+                        }
+                        else 
+                        {
+                            log("\tfcg_dispatch bypass: failed to move pid %u on cpu %d", 2, pid_to_pull, cpu);
+                        }
+                    }
+                }
+
+                log("\tfcg_dispatch bypass: Finished scanning DSQ for pid %u on cpu %d (cgid %llu)", 2, pid_to_pull, cpu, cgid_to_pull);
+                
+                bpf_iter_scx_dsq_destroy(&it);
+            }
+            else 
+            {
+                log("\tfcg_dispatch bypass: cancelling bypass because of affinity for pid %u on cpu %d", 2, pid_to_pull, cpu);
+            }
+
+            bpf_task_release(owner_task);
+
+            if (pulled) return;
+        }
+    }
+    }
+    // --- END BYPASS ---
+
+
     if (!cpuc->cur_bk_cgid)
         goto pick_next_cgroup;
 
@@ -2611,6 +2900,8 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
     taskc->last_cpu         = nr_cpus;
     taskc->enq_cgid         = 0;
     taskc->rt_cpu           = nr_cpus;
+    taskc->cur_cgid         = args->cgroup->kn->id;
+    taskc->rt_class         = cgc->rt_class;
 
     if (!(cgc = find_cgrp_ctx(args->cgroup)))
         return -ENOENT;
@@ -2736,6 +3027,9 @@ void BPF_STRUCT_OPS(fcg_cgroup_move, struct task_struct *p,
     ///// MOVE CHANGES AFTER THIS /////
     struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if ( !taskc ) return;
+
+    taskc->rt_class = to_cgc->rt_class;
+    taskc->cur_cgid = to->kn->id;
 
     if (!from_cgc->rt_class && to_cgc->rt_class && taskc->rt_cpu >= nr_cpus)
     {
