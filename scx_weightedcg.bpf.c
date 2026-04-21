@@ -44,6 +44,7 @@ struct fcg_cpu_ctx {
     u64			cur_bk_at;
 
     u64         rt_cnt;
+    u64         pi_boost_cnt;
     u64         bk_cnt;
     u64         bk_cnt_pending;
 
@@ -104,6 +105,7 @@ struct fcg_task_ctx {
     u32     rt_cpu;         // stable CPU assigned to this RT task
 
     u32     cur_cpu;        // where it's running
+    u32     pi_boosted_cpu; // cpu temporarily reserved for PI boost
 
     u32     last_cpu;       // where it last ran
 
@@ -284,7 +286,6 @@ static __always_inline void cnt_dec(struct fcg_cpu_ctx *cpuc, bool is_rt, u32 cp
         scx_bpf_error("cnt underflow for cpu %u for pid %d (rt=%u)", cpu, pid, (u32)is_rt);
     }
 }
-
 enum cpu_runcls { CPU_IDLING = 0, CPU_BK, CPU_RT };
 
 static __always_inline enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
@@ -1176,6 +1177,56 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct fcg_cgrp_ctx *cgc)
 
 /* CPUSET ASSIGNMENT START */
 
+static __always_inline void pi_boost_inc(struct fcg_task_ctx *taskc, u32 cpu, s32 pid)
+{
+    struct fcg_cpu_ctx *cpuc;
+
+    if (!taskc)
+        return;
+    if (taskc->pi_boosted_cpu == cpu)
+        return;
+
+    cpuc = find_cpu_ctx(cpu);
+    if (!cpuc)
+        return;
+
+    __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+    __sync_fetch_and_add(&cpuc->pi_boost_cnt, 1);
+    taskc->pi_boosted_cpu = cpu;
+}
+
+static __always_inline void pi_boost_dec(struct fcg_task_ctx *taskc, s32 pid)
+{
+    struct fcg_cpu_ctx *cpuc;
+    u32 cpu;
+    u64 old;
+
+    if (!taskc)
+        return;
+
+    cpu = taskc->pi_boosted_cpu;
+    if (cpu >= nr_cpus)
+        return;
+
+    cpuc = find_cpu_ctx(cpu);
+    taskc->pi_boosted_cpu = nr_cpus;
+    if (!cpuc)
+        return;
+
+    old = __sync_fetch_and_sub(&cpuc->rt_cnt, 1);
+    if (old == 0) {
+        log("\tpi_boost_dec: ERROR, rt_cnt underflow on cpu %u for pid %d", 0, cpu, pid);
+        __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+    }
+
+    old = __sync_fetch_and_sub(&cpuc->pi_boost_cnt, 1);
+    if (old == 0) {
+        log("\tpi_boost_dec: ERROR, pi_boost_cnt underflow on cpu %u for pid %d", 0, cpu, pid);
+        __sync_fetch_and_add(&cpuc->pi_boost_cnt, 1);
+    }
+}
+
+
 struct rt_cpu_assign_state {
     u32 next_cpu;   // 0, 2, 4, ...
 };
@@ -1561,6 +1612,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
         {
             s32 tgt = taskc->sel_cpu;
             u64 cgid = cgrp->kn->id;
+            bool pi_block_preempt = false;
 
             cgrp_enqueue_stat(cgrp, cgc, p->pid);
             task_enqueue_stat(p, taskc, cgid, is_idle, can_kick);
@@ -1570,6 +1622,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
             struct fcg_cpu_ctx *tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
             if (tgtc)
             {
+                pi_block_preempt = __sync_fetch_and_add(&tgtc->pi_boost_cnt, 0) > 0;
                 #if RT_VTIME
                 if ( !is_idle && !can_kick )
                 {
@@ -1589,7 +1642,8 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
             }
 
             u64 rt_flags = SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD;
-            if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD |SCX_ENQ_PREEMPT;
+            if ( is_idle || can_kick || (is_behind && !pi_block_preempt) )
+                rt_flags |= SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
 
@@ -2188,7 +2242,7 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         #endif
     }
 
-    log("\trunning cpu=%d: pid %d comm %s (cur_cgid <= %llu, slice=%llu)", (cgc ? cgc->rt_class : 0), cpu, p->pid, p->comm, cgid, p->scx.slice);
+    log("\trunning cpu=%d: pid %d comm %s (cur_cgid <= %llu, slice=%llu)", cpu == 0 ? 2 : 0/*(cgc ? cgc->rt_class : 0)*/, cpu, p->pid, p->comm, cgid, p->scx.slice);
 
     if (cgc) 
     {
@@ -2271,6 +2325,8 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
 		taskc->bypassed_at = 0;
 	}
 
+    pi_boost_dec(taskc, p->pid);
+
 	bpf_cgroup_release(cgrp);
 
 log_and_out:
@@ -2297,6 +2353,8 @@ log_and_out:
     {
         log("\tstopping: WARNING, pid %d on cpu %d comm %s ran %llu ns", rt_class, p->pid, cpu, p->comm, delta);
     }
+
+    rt_class = cpu == 0 ? 2 : 0; // TODO: TEMPORARY REMOVE
 
     if ( !runnable )
     {
@@ -2610,9 +2668,9 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
     if (!cpuc)
         return;
 
-    pg_rb_try_drain();
-
     // --- MULTI-LOCK PRIORITY INVERSION BYPASS ---
+
+    pg_rb_try_drain();
 
     if ( cpu == 0 ) // TEMPORARY: REMOVE
     {
@@ -2686,6 +2744,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
                             // CLAIM IT: Atomically clear the slot
                             __sync_val_compare_and_swap(slot, pid_to_pull, 0);
                             
+                            pi_boost_inc(o_ctx, cpu, pid_to_pull);
                             cnt_inc_pending(cpuc, cpu);
                             cpuc->cur_bk_cgid = cgid_to_pull;
                             cpuc->cur_bk_at = now;
@@ -2896,6 +2955,7 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
         return -ENOMEM;
 
     taskc->cur_cpu          = nr_cpus;
+    taskc->pi_boosted_cpu   = nr_cpus;
     taskc->sel_cpu          = nr_cpus;
     taskc->last_cpu         = nr_cpus;
     taskc->enq_cgid         = 0;
@@ -3119,6 +3179,7 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
     log("\tfcg_task_exit: task with pid %d (cgid %llu) exiting!!!", rt_class, p->pid, cgid);
 
     // TODO: Is this sufficient???
+    pi_boost_dec(taskc, p->pid);
     cnt_dec( cpuc, rt_class, cur_cpu, p->pid, 0 );
     rt_clear_claim( cur_cpu, p->pid );
 
