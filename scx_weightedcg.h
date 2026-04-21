@@ -44,6 +44,7 @@ enum fcg_stat_idx {
 	FCG_STAT_BPF_MSG,
 	FCG_STAT_BPF_CONFLICT,
 	FCG_STAT_BPF_BOOST,
+	FCG_STAT_BPF_DP_BOOST,
 
 	FCG_NR_STATS,
 };
@@ -105,7 +106,7 @@ struct fcg_cgrp_stats {
 #endif
 
 #ifndef FCG_DEBUG
-#define FCG_DEBUG 1
+#define FCG_DEBUG 0
 #endif
 
 #ifndef FCG_BUDDIES
