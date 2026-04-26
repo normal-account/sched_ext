@@ -107,11 +107,11 @@ struct fcg_cgrp_stats {
 #endif
 
 #ifndef RT_VTIME
-#define RT_VTIME 0
+#define RT_VTIME 1
 #endif
 
 #ifndef RT_ACTIVE_CHECK
-#define RT_ACTIVE_CHECK 1
+#define RT_ACTIVE_CHECK 0
 #endif
 
 #if FCG_DEBUG

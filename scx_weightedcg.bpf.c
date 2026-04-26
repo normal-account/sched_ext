@@ -16,9 +16,9 @@ const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
 
 const u32 NR_CPUS_LOG = 96;
-#if RT_ACTIVE_CHECK
-const u64 BK_ACTIVE_SLICE_NS = 20000ULL;
-#endif
+//#if RT_ACTIVE_CHECK
+const u64 BK_ACTIVE_SLICE_NS = 2000ULL;
+//#endif
 u64 cvtime_now;
 
 UEI_DEFINE(uei);
@@ -1399,7 +1399,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
                     // Determine if task should be enqueued at head or not
                     u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
                     u64 tv    = p->scx.dsq_vtime;
-                    u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
+                    //u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
     
                     s64 d = time_delta(now_v, tv);   // signed
                     is_behind = d > 0;//(s64)slack_v;
@@ -1412,7 +1412,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
             }
 
             u64 rt_flags = SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD;
-            if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD |SCX_ENQ_PREEMPT;
+            if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
 
@@ -1440,8 +1440,8 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 
 	s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
     
-	//if (is_idle) {
-    if (is_idle && p->nr_cpus_allowed != nr_cpus) {
+	if (is_idle) {
+    //if (is_idle && p->nr_cpus_allowed != nr_cpus) {
 		struct fcg_cpu_ctx *cpuc = find_cpu_ctx(cpu);
 		enum cpu_runcls cls = cpu_cls(cpu, 0);
 
@@ -1454,12 +1454,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 			{
 				set_bypassed_at(p, taskc);
 				stat_inc(FCG_STAT_LOCAL);
-                #if RT_ACTIVE_CHECK
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, 0);
-                #else
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-                #endif
-
             }
 			else
 			{
@@ -1751,7 +1746,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
                 // Determine if task should be enqueued at head or not
                 u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
                 u64 tv    = p->scx.dsq_vtime;
-                u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
+                //u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
 
                 s64 d = time_delta(now_v, tv);   // signed
                 is_behind = d > 0;//(s64)slack_v;
@@ -1803,24 +1798,17 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
              * more control over when tasks with custom cpumask get issued.
              */
             //
-            if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
-            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
+            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
+            if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
             //if (false) {
                 stat_inc(FCG_STAT_LOCAL);
-                #if RT_ACTIVE_CHECK
-                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, enq_flags);
-                #else 
-                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
-                #endif
-            
+                scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
+                    enq_flags);
             } else
             {
                 stat_inc(FCG_STAT_GLOBAL);
-                #if RT_ACTIVE_CHECK
-                scx_bpf_dsq_insert(p, FALLBACK_DSQ, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, enq_flags);
-                #else
-                scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL, enq_flags);
-                #endif
+                scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL,
+                    enq_flags);
             }
             goto out_release;
         }
@@ -1843,11 +1831,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
 
-        #if RT_ACTIVE_CHECK
         scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, tgtc && tgtc->rt_active ? BK_ACTIVE_SLICE_NS : task_slice_ns, tvtime, enq_flags);
-        #else
-        scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
-        #endif
         // TODO: REMOVE
         //fcg_dump_cgroup_tasks(p->pid, cgid, p->scx.dsq_vtime);
     }
@@ -2022,10 +2006,11 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         else
         {
             cgrp_running_stat( cgid, cgc, cpuc );
-            #if RT_ACTIVE_CHECK
-            if ( cgc->weight < 100 && cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
+            //#if RT_ACTIVE_CHECK
+            if ( cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
+            //if ( cgc->weight < 100 && cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
                 p->scx.slice = BK_ACTIVE_SLICE_NS;
-            #endif
+            //#endif
         }
 
         // Decrement the enq_count if applicable and set the enq cgid to 0
