@@ -20,6 +20,7 @@ const u32 NR_CPUS_LOG = 96;
 const u64 BK_ACTIVE_SLICE_NS = 2000ULL;
 //#endif
 u64 cvtime_now;
+u64 fallback_vtime_now;
 
 UEI_DEFINE(uei);
 
@@ -107,6 +108,9 @@ struct fcg_task_ctx {
 
     u32     last_cpu;       // where it last ran
 
+    u64     fallback_slice_ns;
+    u8      fallback_weighted; // task is resident in weighted fallback DSQ
+
 #if FCG_DEBUG
     u64 run_start_exec_ns;
 
@@ -164,7 +168,6 @@ static __always_inline u64 cls_get_bk(void)
     struct cls_counters *c = bpf_map_lookup_elem(&cls_cnts, &k);
     return c ? c->bk : 0;
 }
-
 
 static __always_inline bool increment_enq_count( struct fcg_task_ctx *taskc, struct fcg_cgrp_ctx *cgc, u64 cgid)
 {
@@ -1454,6 +1457,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 			{
 				set_bypassed_at(p, taskc);
 				stat_inc(FCG_STAT_LOCAL);
+                taskc->fallback_weighted = 0;
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, 0);
             }
 			else
@@ -1763,6 +1767,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         if ( is_idle || can_kick || is_behind ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
+        taskc->fallback_weighted = 0;
         scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
 
         taskc->cur_cpu = tgt;
@@ -1802,13 +1807,23 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
             if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
             //if (false) {
                 stat_inc(FCG_STAT_LOCAL);
+                taskc->fallback_weighted = 0;
                 scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
                     enq_flags);
             } else
             {
+                u64 tvtime = p->scx.dsq_vtime;
+                u64 slice = cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : task_slice_ns;
+
                 stat_inc(FCG_STAT_GLOBAL);
-                scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL,
-                    enq_flags);
+                cgrp_refresh_hweight(cgrp, cgc);
+
+                if (time_before(tvtime, fallback_vtime_now - task_slice_ns))
+                    tvtime = fallback_vtime_now - task_slice_ns;
+
+                taskc->fallback_weighted = 1;
+                taskc->fallback_slice_ns = slice;
+                scx_bpf_dsq_insert_vtime(p, FALLBACK_DSQ, slice, tvtime, enq_flags);
             }
             goto out_release;
         }
@@ -1826,6 +1841,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         // Credit once per DSQ residency
         increment_enq_count( taskc, cgc, cgid );
+        taskc->fallback_weighted = 0;
 
         cgrp_enqueued(cgrp, cgc);
 
@@ -2040,17 +2056,6 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
 
 
     int rt_class = 0;
-    /*
-    * Scale the execution time by the inverse of the weight and charge.
-    *
-    * Note that the default yield implementation yields by setting
-    * @p->scx.slice to zero and the following would treat the yielding task
-    * as if it has consumed all its slice. If this penalizes yielding tasks
-    * too much, determine the execution time by taking explicit timestamps
-    * instead of depending on @p->scx.slice.
-    */
-    p->scx.dsq_vtime += (task_slice_ns - p->scx.slice) * 100 / p->scx.weight;
-
     taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if (!taskc) {
         scx_bpf_error("task_ctx lookup failed");
@@ -2063,6 +2068,24 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     u64 cgid = cgrp ? cgrp->kn->id : 0;
 
     rt_class = cgc && cgc->rt_class;
+
+    /*
+    * Scale the execution time by the inverse of the weight and charge.
+    * Pinned BK tasks in FALLBACK_DSQ don't go through cgv_tree_bk, so make
+    * their task vtime carry the cgroup weight directly.
+    */
+    if (taskc->fallback_weighted && cgc && !cgc->rt_class) {
+        u64 charged_slice = taskc->fallback_slice_ns ?: task_slice_ns;
+        u64 used = charged_slice > p->scx.slice ? charged_slice - p->scx.slice : 0;
+        p->scx.dsq_vtime += used * FCG_HWEIGHT_ONE / (cgc->hweight ?: 1);
+        if (time_before(fallback_vtime_now, p->scx.dsq_vtime))
+            fallback_vtime_now = p->scx.dsq_vtime;
+    } else {
+        u64 used = task_slice_ns > p->scx.slice ? task_slice_ns - p->scx.slice : 0;
+        p->scx.dsq_vtime += used * 100 / p->scx.weight;
+    }
+    taskc->fallback_weighted = 0;
+    taskc->fallback_slice_ns = 0;
 
     if ( cpuc && cgc && cgc->rt_class )
     {
@@ -2124,6 +2147,12 @@ log_and_out:
 #define DEQUEUE_SLEEP 1
 void BPF_STRUCT_OPS(fcg_dequeue, struct task_struct *p, u64 deq_flags)
 {
+    struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    if (taskc) {
+        taskc->fallback_weighted = 0;
+        taskc->fallback_slice_ns = 0;
+    }
+
     if (deq_flags & DEQUEUE_SLEEP)
     {
         log("\tfcg_dequeue: SLEEP pid %d comm %s", 1, p->pid, p->comm);
@@ -2596,6 +2625,8 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
     taskc->last_cpu         = nr_cpus;
     taskc->enq_cgid         = 0;
     taskc->rt_cpu           = nr_cpus;
+    taskc->fallback_slice_ns = 0;
+    taskc->fallback_weighted = 0;
 
     if (!(cgc = find_cgrp_ctx(args->cgroup)))
         return -ENOENT;
