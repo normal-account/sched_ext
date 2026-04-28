@@ -16,11 +16,13 @@ const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
 
 const u32 NR_CPUS_LOG = 96;
-//#if RT_ACTIVE_CHECK
-const u64 BK_ACTIVE_SLICE_NS = 2000ULL;
-//#endif
+#if RT_ACTIVE_CHECK
+const u64 BK_ACTIVE_SLICE_NS = 20000ULL;
+#endif
 u64 cvtime_now;
+#if FCG_WEIGHTED_FALLBACK_DSQ
 u64 fallback_vtime_now;
+#endif
 
 UEI_DEFINE(uei);
 
@@ -51,7 +53,9 @@ struct fcg_cpu_ctx {
     u64 rt_vtime_now;   // min-vtime base for RT tasks on this CPU
 
     u32 rt_claim_pid;  // 0 = free, else pid that reserved this cpu for RT
+    #if RT_ACTIVE_CHECK
     u32 rt_active;     // 1 once an RT task has been assigned to this CPU
+    #endif
 
 #if FCG_DEBUG
     u64  first_move_ts;         // when we successfully moved that DSQ to local
@@ -108,8 +112,10 @@ struct fcg_task_ctx {
 
     u32     last_cpu;       // where it last ran
 
+#if FCG_WEIGHTED_FALLBACK_DSQ
     u64     fallback_slice_ns;
     u8      fallback_weighted; // task is resident in weighted fallback DSQ
+#endif
 
 #if FCG_DEBUG
     u64 run_start_exec_ns;
@@ -235,7 +241,9 @@ static __always_inline void cnt_inc(struct fcg_cpu_ctx *cpuc, u32 cpu, s32 pid, 
     if (!cpuc) return;
     if (is_rt) {
         __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+        #if RT_ACTIVE_CHECK
         cpuc->rt_active = 1;
+        #endif
     }
     else       __sync_fetch_and_add(&cpuc->bk_cnt, 1);
 }
@@ -1414,7 +1422,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
                 cnt_inc(tgtc, tgt, p->pid, true);
             }
 
-            u64 rt_flags = SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD;
+            u64 rt_flags = SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD;
             if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
@@ -1457,8 +1465,10 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 			{
 				set_bypassed_at(p, taskc);
 				stat_inc(FCG_STAT_LOCAL);
+#if FCG_WEIGHTED_FALLBACK_DSQ
                 taskc->fallback_weighted = 0;
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : SCX_SLICE_DFL, 0);
+#endif
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
             }
 			else
 			{
@@ -1767,7 +1777,9 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         if ( is_idle || can_kick || is_behind ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
+#if FCG_WEIGHTED_FALLBACK_DSQ
         taskc->fallback_weighted = 0;
+#endif
         scx_bpf_dsq_insert( p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags );
 
         taskc->cur_cpu = tgt;
@@ -1803,17 +1815,24 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
              * more control over when tasks with custom cpumask get issued.
              */
             //
-            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
-            if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
+            if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
+            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
             //if (false) {
                 stat_inc(FCG_STAT_LOCAL);
+#if FCG_WEIGHTED_FALLBACK_DSQ
                 taskc->fallback_weighted = 0;
+#endif
                 scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
                     enq_flags);
             } else
             {
+#if FCG_WEIGHTED_FALLBACK_DSQ
                 u64 tvtime = p->scx.dsq_vtime;
+                #if RT_ACTIVE_CHECK
                 u64 slice = cpuc && cpuc->rt_active ? BK_ACTIVE_SLICE_NS : task_slice_ns;
+                #else
+                u64 slice = task_slice_ns;
+                #endif
 
                 stat_inc(FCG_STAT_GLOBAL);
                 cgrp_refresh_hweight(cgrp, cgc);
@@ -1824,6 +1843,11 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
                 taskc->fallback_weighted = 1;
                 taskc->fallback_slice_ns = slice;
                 scx_bpf_dsq_insert_vtime(p, FALLBACK_DSQ, slice, tvtime, enq_flags);
+#else
+                stat_inc(FCG_STAT_GLOBAL);
+                scx_bpf_dsq_insert(p, FALLBACK_DSQ, SCX_SLICE_DFL,
+                    enq_flags);
+#endif
             }
             goto out_release;
         }
@@ -1841,13 +1865,15 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 
         // Credit once per DSQ residency
         increment_enq_count( taskc, cgc, cgid );
+#if FCG_WEIGHTED_FALLBACK_DSQ
         taskc->fallback_weighted = 0;
+#endif
 
         cgrp_enqueued(cgrp, cgc);
 
         tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
 
-        scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, tgtc && tgtc->rt_active ? BK_ACTIVE_SLICE_NS : task_slice_ns, tvtime, enq_flags);
+        scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
         // TODO: REMOVE
         //fcg_dump_cgroup_tasks(p->pid, cgid, p->scx.dsq_vtime);
     }
@@ -2022,11 +2048,11 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         else
         {
             cgrp_running_stat( cgid, cgc, cpuc );
-            //#if RT_ACTIVE_CHECK
+            #if RT_ACTIVE_CHECK
             if ( cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
             //if ( cgc->weight < 100 && cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
                 p->scx.slice = BK_ACTIVE_SLICE_NS;
-            //#endif
+            #endif
         }
 
         // Decrement the enq_count if applicable and set the enq cgid to 0
@@ -2074,6 +2100,7 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     * Pinned BK tasks in FALLBACK_DSQ don't go through cgv_tree_bk, so make
     * their task vtime carry the cgroup weight directly.
     */
+#if FCG_WEIGHTED_FALLBACK_DSQ
     if (taskc->fallback_weighted && cgc && !cgc->rt_class) {
         u64 charged_slice = taskc->fallback_slice_ns ?: task_slice_ns;
         u64 used = charged_slice > p->scx.slice ? charged_slice - p->scx.slice : 0;
@@ -2086,7 +2113,14 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
     }
     taskc->fallback_weighted = 0;
     taskc->fallback_slice_ns = 0;
+#else
+    {
+        u64 used = task_slice_ns > p->scx.slice ? task_slice_ns - p->scx.slice : 0;
+        p->scx.dsq_vtime += used * 100 / p->scx.weight;
+    }
+#endif
 
+#if RT_VTIME
     if ( cpuc && cgc && cgc->rt_class )
     {
         u64 v = p->scx.dsq_vtime;
@@ -2094,6 +2128,7 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
         if (time_before(cur, v))
             __sync_val_compare_and_swap(&cpuc->rt_vtime_now, cur, v);
     }
+#endif
 
 	if (cgc && taskc->bypassed_at)
     {
@@ -2147,11 +2182,13 @@ log_and_out:
 #define DEQUEUE_SLEEP 1
 void BPF_STRUCT_OPS(fcg_dequeue, struct task_struct *p, u64 deq_flags)
 {
+#if FCG_WEIGHTED_FALLBACK_DSQ
     struct fcg_task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if (taskc) {
         taskc->fallback_weighted = 0;
         taskc->fallback_slice_ns = 0;
     }
+#endif
 
     if (deq_flags & DEQUEUE_SLEEP)
     {
@@ -2464,8 +2501,10 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
      * paths that take cgv_tree_lock. Just reset and go straight to a
      * single-shot BK dispatch attempt.
      */
+    #if RT_ACTIVE_CHECK
     if ( cpuc->rt_active )
         goto pick_next_cgroup;
+    #endif
 
     if ( time_before(now, cpuc->cur_bk_at + cgrp_slice_ns) ) {
 
@@ -2572,8 +2611,11 @@ pick_next_cgroup:
         if ( cpu < NR_CPUS_LOG )
             log("\tfcg_dispatch: pick_next_cgroup trying to move BK to local (size %u) on cpu %d", 0, cls_get_bk(), cpu);
 
-        u32 max_retries = cpuc->rt_active ? 2 : CGROUP_MAX_RETRIES;
-        bpf_repeat(max_retries) {
+        #if RT_ACTIVE_CHECK
+        bpf_repeat(cpuc->rt_active ? 2 : CGROUP_MAX_RETRIES) {
+        #else
+        bpf_repeat(CGROUP_MAX_RETRIES) {
+        #endif
             if (try_pick_next_cgroup( &cpuc->cur_bk_cgid, &cgv_tree_bk, cpu, cpuc )) {
                 return;
             }
@@ -2625,8 +2667,10 @@ s32 BPF_STRUCT_OPS(fcg_init_task, struct task_struct *p,
     taskc->last_cpu         = nr_cpus;
     taskc->enq_cgid         = 0;
     taskc->rt_cpu           = nr_cpus;
+#if FCG_WEIGHTED_FALLBACK_DSQ
     taskc->fallback_slice_ns = 0;
     taskc->fallback_weighted = 0;
+#endif
 
     if (!(cgc = find_cgrp_ctx(args->cgroup)))
         return -ENOENT;

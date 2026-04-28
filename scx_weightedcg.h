@@ -107,11 +107,15 @@ struct fcg_cgrp_stats {
 #endif
 
 #ifndef RT_VTIME
-#define RT_VTIME 1
+#define RT_VTIME 0
 #endif
 
 #ifndef RT_ACTIVE_CHECK
 #define RT_ACTIVE_CHECK 0
+#endif
+
+#ifndef FCG_WEIGHTED_FALLBACK_DSQ
+#define FCG_WEIGHTED_FALLBACK_DSQ 0
 #endif
 
 #if FCG_DEBUG
