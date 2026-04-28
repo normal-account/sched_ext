@@ -288,6 +288,12 @@ static __always_inline void cnt_dec(struct fcg_cpu_ctx *cpuc, bool is_rt, u32 cp
 
         scx_bpf_error("cnt underflow for cpu %u for pid %d (rt=%u)", cpu, pid, (u32)is_rt);
     }
+    #if RT_ACTIVE_CHECK
+    // else if (old == 1 && cpuc->rt_active)
+    // {
+    //     cpuc->rt_active = 0;
+    // }
+    #endif
 }
 
 enum cpu_runcls { CPU_IDLING = 0, CPU_BK, CPU_RT };
@@ -1413,7 +1419,8 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
                     //u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
     
                     s64 d = time_delta(now_v, tv);   // signed
-                    is_behind = d > 0;//(s64)slack_v;
+                    is_behind = d > 0;
+                    //is_behind = d > (s64)slack_v;
     
                      log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
                 }
@@ -1422,7 +1429,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
                 cnt_inc(tgtc, tgt, p->pid, true);
             }
 
-            u64 rt_flags = SCX_ENQ_CPU_SELECTED | SCX_ENQ_HEAD;
+            u64 rt_flags = SCX_ENQ_CPU_SELECTED;
             if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
@@ -1763,7 +1770,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
                 //u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
 
                 s64 d = time_delta(now_v, tv);   // signed
-                is_behind = d > 0;//(s64)slack_v;
+                is_behind = d > 0;
+                //is_behind = d > (s64)slack_v;
 
                  log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
             }
@@ -1815,8 +1823,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
              * more control over when tasks with custom cpumask get issued.
              */
             //
-            if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
-            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
+            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
+            if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
             //if (false) {
                 stat_inc(FCG_STAT_LOCAL);
 #if FCG_WEIGHTED_FALLBACK_DSQ
@@ -1826,6 +1834,9 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
                     enq_flags);
             } else
             {
+
+            log("\tfcg_enqueue: RT active and weight < 100, skipping global enqueue for pid %d", 2, p->pid);
+
 #if FCG_WEIGHTED_FALLBACK_DSQ
                 u64 tvtime = p->scx.dsq_vtime;
                 #if RT_ACTIVE_CHECK
@@ -1870,8 +1881,6 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
 #endif
 
         cgrp_enqueued(cgrp, cgc);
-
-        tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
 
         scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, task_slice_ns, tvtime, enq_flags);
         // TODO: REMOVE
@@ -2037,7 +2046,7 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         #endif
     }
 
-    log("\trunning cpu=%d: pid %d comm %s (cur_cgid <= %llu, slice=%llu)", (cgc ? cgc->rt_class : 0), cpu, p->pid, p->comm, cgid, p->scx.slice);
+    log("\trunning cpu=%d: pid %d comm %s (cur_cgid <= %llu, slice=%llu)", (cgc ? 2 : 0), cpu, p->pid, p->comm, cgid, p->scx.slice);
 
     if (cgc) 
     {
@@ -2049,8 +2058,8 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
         {
             cgrp_running_stat( cgid, cgc, cpuc );
             #if RT_ACTIVE_CHECK
-            if ( cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
-            //if ( cgc->weight < 100 && cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
+            //if ( cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
+            if ( cgc->weight < 100 && cpuc && cpuc->rt_active && p->scx.slice > BK_ACTIVE_SLICE_NS )
                 p->scx.slice = BK_ACTIVE_SLICE_NS;
             #endif
         }
@@ -2589,6 +2598,11 @@ pick_next_cgroup:
 
 	if ( scx_bpf_dsq_nr_queued(FALLBACK_DSQ) > 0 )
 	{
+        // #if RT_ACTIVE_CHECK
+        // if ( cpuc->rt_active )
+        //     return;
+        // #endif
+
 		enum cpu_runcls cls = cpu_cls(cpu, 0);
 		if ( cls != CPU_RT )
 		{
