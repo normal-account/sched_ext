@@ -2,50 +2,50 @@
 #define __SCX_WEIGHTEDCG_H
 
 enum {
-	FCG_HWEIGHT_ONE		= 1LLU << 16,
+	HWEIGHT_ONE		= 1LLU << 16,
 };
 
-enum fcg_stat_idx {
-	FCG_STAT_ACT,
-	FCG_STAT_DEACT,
-	FCG_STAT_LOCAL,
-	FCG_STAT_GLOBAL,
+enum stat_idx {
+	STAT_ACT,
+	STAT_DEACT,
+	STAT_LOCAL,
+	STAT_GLOBAL,
 
-	FCG_STAT_HWT_UPDATES,
-	FCG_STAT_HWT_CACHE,
-	FCG_STAT_HWT_SKIP,
-	FCG_STAT_HWT_RACE,
+	STAT_HWT_UPDATES,
+	STAT_HWT_CACHE,
+	STAT_HWT_SKIP,
+	STAT_HWT_RACE,
 
-	FCG_STAT_ENQ_SKIP,
-	FCG_STAT_ENQ_RACE,
-	FCG_STAT_ENQ_IRQ,
-	FCG_STAT_ENQ_KSOFTIRQD,
-	FCG_STAT_ENQ_NAPI,
-	FCG_STAT_ENQ_WQ_WORKER,
-	FCG_STAT_ENQ_KTHREAD,
+	STAT_ENQ_SKIP,
+	STAT_ENQ_RACE,
+	STAT_ENQ_IRQ,
+	STAT_ENQ_KSOFTIRQD,
+	STAT_ENQ_NAPI,
+	STAT_ENQ_WQ_WORKER,
+	STAT_ENQ_KTHREAD,
 
-	FCG_STAT_CNS_KEEP,
-	FCG_STAT_CNS_EXPIRE,
-	FCG_STAT_CNS_EMPTY,
-	FCG_STAT_CNS_GONE,
+	STAT_CNS_KEEP,
+	STAT_CNS_EXPIRE,
+	STAT_CNS_EMPTY,
+	STAT_CNS_GONE,
 
-	FCG_STAT_PNC_NO_CGRP,
-	FCG_STAT_PNC_NEXT,
-	FCG_STAT_PNC_EMPTY,
-	FCG_STAT_PNC_GONE,
-	FCG_STAT_PNC_RACE,
-	FCG_STAT_PNC_FAIL,
-	FCG_STAT_PNC_AFFINITY,
+	STAT_PNC_NO_CGRP,
+	STAT_PNC_NEXT,
+	STAT_PNC_EMPTY,
+	STAT_PNC_GONE,
+	STAT_PNC_RACE,
+	STAT_PNC_FAIL,
+	STAT_PNC_AFFINITY,
 
-	FCG_STAT_BAD_REMOVAL,
+	STAT_BAD_REMOVAL,
 
-	FCG_NR_STATS,
+	STAT_NR,
 };
 
-#define FCG_CPU_MASK_BITS 256
-#define FCG_MASK_WORDS    (FCG_CPU_MASK_BITS / 64)
+#define CPU_MASK_BITS 256
+#define MASK_WORDS    (CPU_MASK_BITS / 64)
 
-struct fcg_cgrp_ctx {
+struct cgrp_ctx {
 	u32			nr_active;
 	u32			nr_runnable;
 	u32			queued;
@@ -60,11 +60,11 @@ struct fcg_cgrp_ctx {
 	u64 enq_count;        	// monotonic, bumps on every enqueue intent
 
 	struct bpf_spin_lock cpuset_lock;
-    __u64 cpuset_mask[FCG_MASK_WORDS];
+    __u64 cpuset_mask[MASK_WORDS];
     __u32 cpuset_init;
 };
 
-struct fcg_cgrp_stats {
+struct cgrp_stats {
 	char  name[8];
 
 	__u64 first_enq_ts;   	// 0 ==> not armed
@@ -98,12 +98,8 @@ struct fcg_cgrp_stats {
 #define DIR_ENQ 1
 #endif
 
-#ifndef FCG_DEBUG
-#define FCG_DEBUG 0
-#endif
-
-#ifndef FCG_BUDDIES
-#define FCG_BUDDIES 0
+#ifndef DEBUG
+#define DEBUG 0
 #endif
 
 #ifndef RT_VTIME
@@ -114,11 +110,27 @@ struct fcg_cgrp_stats {
 #define RT_ACTIVE_CHECK 1
 #endif
 
-#ifndef FCG_WEIGHTED_FALLBACK_DSQ
-#define FCG_WEIGHTED_FALLBACK_DSQ 1
+#ifndef WEIGHTED_FALLBACK_DSQ
+#define WEIGHTED_FALLBACK_DSQ 1
 #endif
 
-#if FCG_DEBUG
+#ifndef PIN_TASKS
+#define PIN_TASKS 1
+#endif
+
+#ifndef RT_CGROUP_NAME
+#define RT_CGROUP_NAME "hw"
+#endif
+
+#ifndef CGROUP_NAME_LEN
+#define CGROUP_NAME_LEN 64
+#endif
+
+#ifndef DUMP_TRACES
+#define DUMP_TRACES 0
+#endif
+
+#if DEBUG
 #define log(fmt, rt_class, ...) if ( rt_class == 2 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
