@@ -53,10 +53,10 @@ static inline double avg_ms(uint64_t sum, uint64_t cnt) { return cnt ? ( (double
 
 static inline double ns_to_ms(uint64_t ns) { return ns ? ( (double)ns / 1e6 ) : 0; }
 
-static void fcg_read_cgrp_stats(struct scx_weightedcg_bpf *skel) 
+static void read_cgrp_stats(struct scx_weightedcg_bpf *skel) 
 {
 	int fd = bpf_map__fd(skel->maps.cgrp_stats);
-	struct fcg_cgrp_stats val;
+	struct cgrp_stats val;
 	__u64 key = 0, next;
 
 	for (;;) {
@@ -152,14 +152,14 @@ static float read_cpu_util(__u64 *last_sum, __u64 *last_idle)
 	return delta_sum ? (float)(delta_sum - delta_idle) / delta_sum : 0.0;
 }
 
-static void fcg_read_stats(struct scx_weightedcg_bpf *skel, __u64 *stats)
+static void read_stats(struct scx_weightedcg_bpf *skel, __u64 *stats)
 {
-	__u64 cnts[FCG_NR_STATS][skel->rodata->nr_cpus];
+	__u64 cnts[STAT_NR][skel->rodata->nr_cpus];
 	__u32 idx;
 
-	memset(stats, 0, sizeof(stats[0]) * FCG_NR_STATS);
+	memset(stats, 0, sizeof(stats[0]) * STAT_NR);
 
-	for (idx = 0; idx < FCG_NR_STATS; idx++) {
+	for (idx = 0; idx < STAT_NR; idx++) {
 		int ret, cpu;
 
 		ret = bpf_map_lookup_elem(bpf_map__fd(skel->maps.stats),
@@ -178,7 +178,7 @@ int main(int argc, char **argv)
 	struct timespec intv_ts = { .tv_sec = 2, .tv_nsec = 0 };
 	bool dump_cgrps = false;
 	__u64 last_cpu_sum = 0, last_cpu_idle = 0;
-	__u64 last_stats[FCG_NR_STATS] = {};
+	__u64 last_stats[STAT_NR] = {};
 	unsigned long seq = 0;
 	__s32 opt;
 	__u64 ecode;
@@ -194,11 +194,8 @@ restart:
 	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
 	assert(skel->rodata->nr_cpus > 0);
 
-	skel->rodata->cgrp_slice_ns = 20000;
-	skel->rodata->task_slice_ns = 20000;
-
-	//skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
-	//skel->rodata->task_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
+	skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
+	skel->rodata->task_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
 
 	printf("slice=%.1lfms intv=%.1lfs dump_cgrps=%d",
 	       (double)skel->rodata->cgrp_slice_ns / 1000000.0,
@@ -209,15 +206,15 @@ restart:
 	link = SCX_OPS_ATTACH(skel, weightedcg_ops, scx_weightedcg_bpf);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
-		__u64 acc_stats[FCG_NR_STATS];
-		__u64 stats[FCG_NR_STATS];
+		__u64 acc_stats[STAT_NR];
+		__u64 stats[STAT_NR];
 		float cpu_util;
 		int i;
 
 		cpu_util = read_cpu_util(&last_cpu_sum, &last_cpu_idle);
 
-		fcg_read_stats(skel, acc_stats);
-		for (i = 0; i < FCG_NR_STATS; i++)
+		read_stats(skel, acc_stats);
+		for (i = 0; i < STAT_NR; i++)
 			stats[i] = acc_stats[i] - last_stats[i];
 
 		memcpy(last_stats, acc_stats, sizeof(acc_stats));
@@ -225,35 +222,40 @@ restart:
 		printf("\n[SEQ %6lu cpu=%5.1lf hweight_gen=%" PRIu64 "]\n",
 		       seq++, cpu_util * 100.0, skel->data->hweight_gen);
 		printf("RUNNING     act:%6llu  deact:%6llu global:%6llu local:%6llu\n",
-		       stats[FCG_STAT_ACT],
-		       stats[FCG_STAT_DEACT],
-		       stats[FCG_STAT_GLOBAL],
-		       stats[FCG_STAT_LOCAL]);
+		       stats[STAT_ACT],
+		       stats[STAT_DEACT],
+		       stats[STAT_GLOBAL],
+		       stats[STAT_LOCAL]);
 		printf("CGRP ENQ  cache:%6llu update:%6llu   skip:%6llu  race:%6llu\n",
-		       stats[FCG_STAT_HWT_CACHE],
-		       stats[FCG_STAT_HWT_UPDATES],
-		       stats[FCG_STAT_HWT_SKIP],
-		       stats[FCG_STAT_HWT_RACE]);
-		printf("ENQUEUE    skip:%6llu   race:%6llu\n",
-		       stats[FCG_STAT_ENQ_SKIP],
-		       stats[FCG_STAT_ENQ_RACE]);
+		       stats[STAT_HWT_CACHE],
+		       stats[STAT_HWT_UPDATES],
+		       stats[STAT_HWT_SKIP],
+		       stats[STAT_HWT_RACE]);
+		printf("ENQUEUE    skip:%6llu   race:%6llu kworkr:%6llu  napi:%6llu  softirq:%6llu  wq worker:%6llu  kthread:%6llu\n",
+		       stats[STAT_ENQ_SKIP],
+		       stats[STAT_ENQ_RACE],
+			   stats[STAT_ENQ_IRQ],
+			   stats[STAT_ENQ_NAPI],
+			   stats[STAT_ENQ_KSOFTIRQD],
+			   stats[STAT_ENQ_WQ_WORKER],
+			   stats[STAT_ENQ_KTHREAD]);
 		printf("DISPATCH   keep:%6llu expire:%6llu  empty:%6llu  gone:%6llu\n",
-		       stats[FCG_STAT_CNS_KEEP],
-		       stats[FCG_STAT_CNS_EXPIRE],
-		       stats[FCG_STAT_CNS_EMPTY],
-		       stats[FCG_STAT_CNS_GONE]);
-		printf("PICK NEXT  next:%6llu  empty:%6llu nocgrp:%6llu  gone:%6llu race:%6llu fail:%6llu aff-fail:%6llu\n",
-		       stats[FCG_STAT_PNC_NEXT],
-		       stats[FCG_STAT_PNC_EMPTY],
-		       stats[FCG_STAT_PNC_NO_CGRP],
-		       stats[FCG_STAT_PNC_GONE],
-		       stats[FCG_STAT_PNC_RACE],
-		       stats[FCG_STAT_PNC_FAIL],
-			   stats[FCG_STAT_PNC_AFFINITY]);
+		       stats[STAT_CNS_KEEP],
+		       stats[STAT_CNS_EXPIRE],
+		       stats[STAT_CNS_EMPTY],
+		       stats[STAT_CNS_GONE]);
+		printf("PICK NEXT  next:%6llu  empty:%6llu nocgrp:%6llu  gone:%6llu     race:%6llu       fail:%6llu aff-fail:%6llu\n",
+		       stats[STAT_PNC_NEXT],
+		       stats[STAT_PNC_EMPTY],
+		       stats[STAT_PNC_NO_CGRP],
+		       stats[STAT_PNC_GONE],
+		       stats[STAT_PNC_RACE],
+		       stats[STAT_PNC_FAIL],
+			   stats[STAT_PNC_AFFINITY]);
 		printf("BAD      remove:%6llu\n",
-		       acc_stats[FCG_STAT_BAD_REMOVAL]);
+		       acc_stats[STAT_BAD_REMOVAL]);
 
-		fcg_read_cgrp_stats( skel );
+		read_cgrp_stats( skel );
 		
 		fflush(stdout);
 
@@ -267,7 +269,9 @@ restart:
 	if (UEI_ECODE_RESTART(ecode))
 		goto restart;
 
+#if DUMP_TRACES
 	assert( 0 == system("./dump_traces.sh") );
+#endif
 
 	return 0;
 }
